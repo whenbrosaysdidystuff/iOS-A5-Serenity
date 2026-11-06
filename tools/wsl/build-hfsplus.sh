@@ -11,7 +11,7 @@ OUT=~/wsl-hfsplus
 SRC=~/wsl-kernel/WSL2-Linux-Kernel-$TAG
 say() { printf '\n=== %s\n' "$*"; }
 
-if grep -qw hfsplus /proc/filesystems; then echo "HFS+ is already available."; exit 0; fi
+if grep -qw hfsplus /proc/filesystems; then echo "HFSPLUS_OK (already available)"; exit 0; fi
 if [[ -f $OUT/hfsplus.ko ]] && sudo insmod $OUT/hfsplus.ko && grep -qw hfsplus /proc/filesystems; then
 	echo "HFSPLUS_OK (loaded the module built earlier)"; exit 0
 fi
@@ -42,11 +42,11 @@ fi
 echo "kernel release matches: $REL"
 
 say "4/6 building the kernel once for its symbol versions ($(nproc) cores; 20-60 minutes)"
-make -s -j"$(nproc)" vmlinux
+[[ -f vmlinux.symvers ]] || make -s -j"$(nproc)" vmlinux   # needs ~16 GB RAM+swap for the link (.wslconfig swap=24GB)
 cp vmlinux.symvers Module.symvers
 
 say "5/6 building hfsplus.ko"
-make -s -j"$(nproc)" M=fs/hfsplus modules
+make -s -j"$(nproc)" M="$PWD/fs/hfsplus" modules   # absolute M= (6.18)
 mkdir -p $OUT && cp fs/hfsplus/hfsplus.ko $OUT/
 modinfo $OUT/hfsplus.ko | grep -E 'vermagic|depends'
 
