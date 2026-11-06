@@ -38,9 +38,14 @@ jobs:
       contents: write   # publish the kernel to the kernel-builds branch (see last step)
     # macos-14 (Xcode 15) was retired on 2026-11-02. macos-15 only has Xcode 16, whose iig
     # emits IORPC.kernelContent; patch 0083 adds that field to this xnu.
-    # Intel image: GitHub's arm64 macOS pool is capacity-constrained (jobs were dropped
-    # unacquired); Xcode cross-compiles the arm64 kernel the same way on x86_64.
-    runs-on: macos-15-intel
+    # Both macOS 15 pools (Xcode 16) have been capacity-constrained, with jobs dropped
+    # unacquired after ~15 min. Ask for one of each: whichever runs first builds and
+    # publishes; the kernel is the same (Xcode cross-compiles arm64 on x86_64 too).
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15-intel, macos-15]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -96,7 +101,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu-buildtree
+          name: xnu-buildtree-${{ matrix.runner }}
           path: buildtree.tgz
           retention-days: 7
 
@@ -123,7 +128,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu-kernel
+          name: xnu-kernel-${{ matrix.runner }}
           path: out/
           if-no-files-found: warn
 
@@ -136,7 +141,7 @@ jobs:
           test -f out/kernel.development.sweet
           rm -rf pub && mkdir pub
           cp out/kernel.development.sweet out/SHA256SUMS pub/ 2>/dev/null || cp out/kernel.development.sweet pub/
-          printf 'source %s\nrun %s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" > pub/BUILD-INFO
+          printf 'source %s\nrun %s\nrunner %s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" "${{ matrix.runner }}" > pub/BUILD-INFO
           cd pub
           git init -q -b kernel-builds
           git add .
