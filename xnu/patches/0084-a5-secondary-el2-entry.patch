@@ -1,0 +1,33 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 381dda8..c004ab2 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -301,16 +301,27 @@ LEXT(sweet_secondary_entry)
+ 	mov		x1, #(1 << 31)
+ 	msr		HCR_EL2, x1
+ 	msr		VTTBR_EL2, xzr
+-	msr		CPTR_EL2, xzr
++	/* Redmi A5: PSCI starts secondaries at EL2. CPTR_EL2 keeps its RES1 bits
++	 * (13:12, 9:0) with TFP/TTA clear, as the a5-ios-port V12 probe did. */
++	mov		x1, #0x33ff
++	msr		CPTR_EL2, x1
+ 	msr		MDCR_EL2, xzr
+ 	mov		x1, #3
+ 	msr		CNTHCTL_EL2, x1
+ 	msr		CNTVOFF_EL2, xzr
++	/* EL1 reads of MIDR/MPIDR return VPIDR/VMPIDR_EL2 (UNKNOWN out of reset);
++	 * reset_vector picks this CPU's data by MPIDR, so make them the real ones. */
++	mrs		x1, MIDR_EL1
++	msr		VPIDR_EL2, x1
++	mrs		x1, MPIDR_EL1
++	msr		VMPIDR_EL2, x1
+ 	/* Permit ICC_SRE_EL1 and GIC CPU interface system-register access. */
+ 	mrs		x1, ICC_SRE_EL2
+ 	orr		x1, x1, #1
+ 	orr		x1, x1, #8
+ 	msr		ICC_SRE_EL2, x1
++	isb
++	msr		ICH_HCR_EL2, xzr		// no virtual GIC interface
+ 	/* Known Armv8 SCTLR RES1 bits, M/C/I off, little endian. */
+ 	MOV64	x1, 0x30d00800
+ 	msr		SCTLR_EL1, x1
