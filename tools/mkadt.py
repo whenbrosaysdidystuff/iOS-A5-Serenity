@@ -30,6 +30,7 @@ HIGH_PHYS_BASE = 0x100000000
 HIGH_MEM_SIZE = 0xfcc00000
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
+A5_EMMC = 0x201d0000   # sdio@201d0000, sprd,sdhci-r11 (probes V10/V11)
 
 GICD, GICD_SIZE = 0x17a00000, 0x10000
 GICR, GICR_SIZE = 0x17a60000, 0x100000
@@ -229,6 +230,13 @@ def build(seed=None, qemu=False, highmem=False, a5=False):
         ('reg', u64(UFS, UFS_SIZE)),
     ])
 
+    # bsd/dev/sweet_emmc.c (A5): the SDHCI v4 eMMC host the bootloader leaves running.
+    emmc = node('sweet-emmc', [
+        ph(),
+        ('compatible', cstr('sprd,sdhci-r11')),
+        ('reg', u64(A5_EMMC, 0x1000)),
+    ])
+
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
     # No effaceable storage: keybagd then reads /private/var/keybags/systembag.kb
@@ -265,7 +273,7 @@ def build(seed=None, qemu=False, highmem=False, a5=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu or a5 else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [emmc] if a5 else [ufs]))
 
 
 if __name__ == '__main__':
