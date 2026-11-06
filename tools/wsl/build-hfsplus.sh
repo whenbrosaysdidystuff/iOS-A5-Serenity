@@ -46,7 +46,8 @@ say "4/6 building the kernel once for its symbol versions ($(nproc) cores; 20-60
 cp vmlinux.symvers Module.symvers
 
 say "5/6 building hfsplus.ko"
-make -s -j"$(nproc)" M="$PWD/fs/hfsplus" modules   # absolute M= (6.18)
+rm -f fs/hfsplus/modules.order fs/hfsplus/Module.symvers
+make -s -j"$(nproc)" fs/hfsplus/hfsplus.ko   # in-tree single-module target (M= fails on 6.18)
 mkdir -p $OUT && cp fs/hfsplus/hfsplus.ko $OUT/
 modinfo $OUT/hfsplus.ko | grep -E 'vermagic|depends'
 
