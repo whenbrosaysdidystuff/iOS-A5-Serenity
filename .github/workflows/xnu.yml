@@ -36,7 +36,9 @@ jobs:
   build:
     # macos-14 (Xcode 15) was retired on 2026-11-02. macos-15 only has Xcode 16, whose iig
     # emits IORPC.kernelContent; patch 0083 adds that field to this xnu.
-    runs-on: macos-15
+    # Intel image: GitHub's arm64 macOS pool is capacity-constrained (jobs were dropped
+    # unacquired); Xcode cross-compiles the arm64 kernel the same way on x86_64.
+    runs-on: macos-15-intel
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
