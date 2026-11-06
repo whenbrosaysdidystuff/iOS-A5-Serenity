@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include "console.h"
 #include "loader.h"
+#include "pmic_wdt.h"
 
 #define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
 
@@ -38,6 +39,12 @@ void shim_main(uint64_t dtb, uint64_t load, uint64_t entry_el)
 	con_hex2("EL", "entry=", (uint32_t)entry_el, "now=", (uint32_t)(rsr("CurrentEL") >> 2));
 	con_hex("LOAD", load);
 	con_hex("DTB", dtb);
+	/* the bootloader leaves the PMIC watchdog armed: 300 s, then a hard reset */
+	uint32_t wctrl = 0;
+	int w = pmic_wdt_stop(&wctrl);
+	static const char wmsg[4][16] = { "stopped", "not running", "adi unverified", "STILL RUNNING" };
+	con_hex2("PMIC WDT", "ctrl=", wctrl, "", 0);
+	con_str("PMIC WDT", wmsg[w]);
 	uint64_t off = payload_off[0], size = payload_off[1];
 	con_hex2("PAYLOAD", "off=", (uint32_t)off, "size=", (uint32_t)size);
 	const char *why = loader_boot((uintptr_t)_head + off, size, dtb);
