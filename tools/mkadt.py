@@ -7,7 +7,7 @@ address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu
 --a5: Redmi A5 (serenity, Unisoc UMS9230) instead of sweet. Values measured on the phone by the
 a5-ios-port probes (see a5-ios-port/HARDWARE-NOTES.md): GICv3 0x10000000/0x10040000, virtual
 timer INTID 27 at 26 MHz, framebuffer 720x1640 at 0x9cf2a000, RAM 0xb8000000-0x13ffff000 (above
-every firmware carve-out; 32 MB aligned), no UFS and no AppleCLCD node yet (first bring-up).
+every firmware carve-out; 32 MB aligned), no UFS node; /sweet-emmc instead. disp0 (software AppleCLCD on the boot framebuffer) as on sweet.
 """
 import hashlib, os, struct, sys
 
@@ -202,7 +202,7 @@ def build(seed=None, qemu=False, highmem=False, a5=False):
         # No hardware: watchdogd checks IODeviceTree:/arm-io/wdt for no-pmu and
         # otherwise crashes trying to set the PMU boot stage (customer builds
         # ignore the -wdt_no_pmu boot-arg).
-        node('wdt', [ph(), ('no-pmu', u32(1))])] + ([] if a5 else [
+        node('wdt', [ph(), ('no-pmu', u32(1))])] + ([] if qemu and a5 else [
         # Main display: IOMobileFramebuffer.framework counts /arm-io children
         # with this device_type and reads the canvas size from the node
         # (the presented iPhone X size, see SweetFramebuffer.cpp);
