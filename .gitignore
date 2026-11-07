@@ -9,3 +9,4 @@ xnu/out/
 xnu/out-*/
 __pycache__/
 probes/*/boot_probe.img
+private/
