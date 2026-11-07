@@ -1,0 +1,73 @@
+diff --git a/bsd/dev/sweet_a5_audio.c b/bsd/dev/sweet_a5_audio.c
+index 172e943..cdbcd91 100644
+--- a/bsd/dev/sweet_a5_audio.c
++++ b/bsd/dev/sweet_a5_audio.c
+@@ -20,6 +20,12 @@
+  * the ADT node /sweet-audio "fs-firmware" (tools/mkadt.py --amp-fw), never built into the
+  * kernel. Only volatile amp registers are written (no OTP command exists in this file).
+  *
++ * FIFO word format: with HW_PARAMS VBC_DAT_L16 the DSP takes one MCDT word per channel sample
++ * (left word, then right word), not one packed L16|R16 word per frame: packed frames played one
++ * octave high and twice as fast (a recorded 440 Hz second came out as 0.5 s of 880 Hz), and the
++ * 2x drain underran the ring (crackle). Each frame is therefore written as two words, the sample
++ * copied into both halves of its word. Boot-arg a5split=0 restores the packed format.
++ *
+  * Userland: /dev/a5audio, write() S16LE stereo 48 kHz (4 bytes per frame); blocks while the
+  * 128 KiB ring is full. ioctl A5AUDIO_SETVOL (0..100) sets a software volume. After 2 s with
+  * no data the stream is stopped and both amplifiers are powered down; the next write starts
+@@ -625,6 +631,7 @@ ring_used(void)
+ /* ---- feed thread: keeps MCDT topped up, starts/stops the stream and the amps */
+ static bool streaming;
+ static uint32_t underruns, restarts;
++static uint32_t split = 1;              /* a5split: one FIFO word per channel sample */
+ 
+ static bool
+ stream_start(void)
+@@ -682,9 +689,17 @@ feed_thread(__unused void *arg, __unused wait_result_t wr)
+ 		if (fill == 0) {
+ 			underruns++;
+ 		}
+-		while (fill < MCDT_FILL_MAX) {
+-			wr32(mcdt + 4 * MCH, ring_used() >= 4 ? next_word() : 0);
+-			fill++;
++		while (fill + (split ? 2 : 1) <= MCDT_FILL_MAX) {
++			uint32_t w = ring_used() >= 4 ? next_word() : 0;
++			if (split) {
++				uint32_t l = w & 0xffff, r = w >> 16;
++				wr32(mcdt + 4 * MCH, l | (l << 16));
++				wr32(mcdt + 4 * MCH, r | (r << 16));
++				fill += 2;
++			} else {
++				wr32(mcdt + 4 * MCH, w);
++				fill++;
++			}
+ 			wrote++;
+ 		}
+ 		/* wake a blocked writer once a quarter of the ring is free */
+@@ -721,7 +736,7 @@ feed_thread(__unused void *arg, __unused wait_result_t wr)
+ 			stuck_since = 0;
+ 		}
+ 		(void)wrote;
+-		sleep_ms(2);
++		sleep_ms(split ? 1 : 2);        /* the FIFO holds ~4.6 ms at 96k words/s */
+ 	}
+ }
+ 
+@@ -860,6 +875,7 @@ audio_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	uint32_t chime_on = 1;
+ 	PE_parse_boot_argn("a5chime", &chime_on, sizeof(chime_on));
++	PE_parse_boot_argn("a5split", &split, sizeof(split));
+ 
+ 	wr32(aon + 0x04, rd32(aon + 0x04) | 4);         /* mailbox clock */
+ 	delay(1000);
+@@ -901,7 +917,8 @@ audio_thread(__unused void *arg, __unused wait_result_t wr)
+ 	lck_mtx_lock(&a5au_lock);
+ 	ready = true;
+ 	lck_mtx_unlock(&a5au_lock);
+-	printf("SWEET A5 AUDIO: ready, /dev/a5audio (S16LE stereo 48 kHz)\n");
++	printf("SWEET A5 AUDIO: ready, /dev/a5audio (S16LE stereo 48 kHz, %s FIFO words)\n",
++	    split ? "per-channel" : "packed");
+ 	if (chime_on) {
+ 		chime();
+ 	}
