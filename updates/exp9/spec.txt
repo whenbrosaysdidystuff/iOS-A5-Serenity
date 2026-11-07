@@ -1,0 +1,9 @@
+# Experiment 9: exp8's 'taps' fix worked (no more 'who?'), but declaring the private Codec
+# properties as custom CF properties made the HAL fail VirtualAudio's reads with 'nope'.
+# They are no longer declared (a5audio.conf custom=1 would bring them back).
+FILE    ../../userland/A5Audio/out/A5Audio.driver/A5Audio /System/Library/Audio/Plug-Ins/HAL/A5Audio.driver/A5Audio 0755 0 0
+REMOVE  /private/var/mobile/Library/Logs/a5/a5audio.log
+KILL    mediaserverd
+COLLECT /private/var/mobile/Library/Logs/a5 2048
+COLLECT /private/var/db/diagnostics/timesync 2048
+COLLECT /private/var/db/diagnostics/Persist 12288

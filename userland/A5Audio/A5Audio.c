@@ -54,6 +54,9 @@ static CFStringRef gUID, gName, gModel;
  * and then only as CF types, so they are published as CFNumbers (settable). */
 static const UInt32 kExtraSel[] = { 'bb2w', 'w2bb', 'fm2r', 'iend' };
 static UInt32 gExtraVal[4];
+/* exp8: declaring them made VirtualAudio read them through the HAL, which then failed with 'nope'
+ * (the HAL only hands custom properties out as CF objects); "custom=1" in a5audio.conf turns it on */
+static int gDeclareCustom;
 
 static int
 extra_index(UInt32 sel)
@@ -152,6 +155,8 @@ read_conf(void)
 					strlcpy(dst, eq + 1, 128);
 				} else if (!strcmp(l, "beep")) {
 					gBeep = eq[1] != '0';
+				} else if (!strcmp(l, "custom")) {
+					gDeclareCustom = eq[1] == '1';
 				}
 			}
 			l = nl ? nl + 1 : NULL;
@@ -462,7 +467,7 @@ A5_GetPropertyDataSize_(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pi
 			*out = sizeof(CFPropertyListRef);
 			return 0;
 		}
-		if (a->mSelector == kAudioObjectPropertyCustomPropertyInfoList) {
+		if (a->mSelector == kAudioObjectPropertyCustomPropertyInfoList && gDeclareCustom) {
 			*out = 4 * sizeof(AudioServerPlugInCustomPropertyInfo);
 			return 0;
 		}
