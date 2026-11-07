@@ -1,0 +1,82 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index bb48068..00f13bc 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -29,6 +29,8 @@ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal, fA5;
++	/* A5: last published state, and the charging candidate (two equal 2 s samples) */
++	int fA5Pct, fA5Charging, fA5Cand, fA5CandCount, fA5Quiet;
+ 	int fLastMode;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+@@ -217,12 +219,38 @@ SweetBattery::poll(void)
+ 			publish(100, 4200, 0, true, true, false, true, false, false);
+ 			return;
+ 		}
+-		bool charging = ama > 10;
++		/*
++		 * Polled every 2 s (the FGU current follows plug/unplug within a second, probe V16).
++		 * Charging needs two equal samples in a row; iOS is only told on a change, or every
++		 * 30 s for the voltage/percent, so the fast polling costs almost nothing.
++		 */
++		/* between -2 and +10 mA (full, or settling): keep the current candidate */
++		int now = ama > 10 ? 1 : (ama < -2 ? 0 : (fA5Cand < 0 ? 0 : fA5Cand));
++		if (now == fA5Cand) {
++			fA5CandCount++;
++		} else {
++			fA5Cand = now;
++			fA5CandCount = 1;
++		}
++		int charging = fA5Charging < 0 ? now : (fA5CandCount >= 2 ? fA5Cand : fA5Charging);
+ 		/* charging raises the terminal voltage: estimate the resting voltage (~150 mOhm) */
+ 		int rest = (int)amv - ama * 150 / 1000;
+ 		unsigned pct = estimatePercent(rest > 0 ? (unsigned)rest : 0);
+-		bool full = charging ? false : (pct >= 99 && ama > -5);
+-		publish(pct, amv, ama, charging, charging, charging, full, true, true);
++		/* the percent must not jump back up when the charger is pulled */
++		if (fA5Pct >= 0 && !charging && (int)pct > fA5Pct) {
++			pct = (unsigned)fA5Pct;
++		}
++		bool full = !charging && pct >= 99 && ama > -5;
++		if (charging != fA5Charging || (int)pct != fA5Pct || ++fA5Quiet >= 15) {
++			if (charging != fA5Charging) {
++				IOLog("SWEET BATTERY: %s (%d mA, %u mV, %u%%)\n",
++				    charging ? "charging" : "on battery", ama, amv, pct);
++			}
++			fA5Charging = charging;
++			fA5Pct = (int)pct;
++			fA5Quiet = 0;
++			publish(pct, amv, ama, charging, charging, charging, full, true, true);
++		}
+ 		return;
+ 	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+@@ -271,7 +299,7 @@ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
+ 		self->poll();
+-		sender->setTimeoutMS(30000);
++		sender->setTimeoutMS(self->fA5 ? 2000 : 30000);
+ 	}
+ }
+ 
+@@ -284,6 +312,8 @@ SweetBattery::start(IOService *provider)
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fA5 = real == 2;
++	fA5Pct = fA5Charging = fA5Cand = -1;
++	fA5CandCount = fA5Quiet = 0;
+ 	fReal = fA5 || (real == 1 && sweet_spmi_init() == 0);
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+@@ -293,7 +323,7 @@ SweetBattery::start(IOService *provider)
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(30000);
++			fTimer->setTimeoutMS(fA5 ? 2000 : 30000);
+ 		} else {
+ 			fReal = false;
+ 			poll();
