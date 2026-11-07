@@ -1,0 +1,11 @@
+# Experiment 15 (shortcut test): with the ringer fixed, VirtualAudio still routes every category to its
+# "Null_Device" (route build for the Built-In Speaker fails without a reason in the log). A5Audio
+# takes the Null_Device UID instead of Codec (it has the lower object ID, so VirtualAudio should meet
+# it first) - if VirtualAudio adopts it, everything it plays lands in A5Audio -> speaker.
+FILE    a5audio.conf /private/var/db/a5audio.conf 0644 0 0
+REMOVE  /private/var/mobile/Library/Logs/a5/a5audio.log
+REMOVE  /private/var/mobile/Library/Logs/a5/vaspy.log
+KILL    mediaserverd
+COLLECT /private/var/mobile/Library/Logs/a5 4096
+COLLECT /private/var/db/diagnostics/timesync 2048
+COLLECT /private/var/db/diagnostics/Persist 12288
