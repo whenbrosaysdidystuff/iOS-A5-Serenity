@@ -365,6 +365,8 @@ hello_beep(void)
 	return NULL;
 }
 
+/* Physical and virtual format are both Float32: the HAL hands WriteMix the PHYSICAL format, and
+ * an S16 physical format (exp18-20) was being read as float (double speed + distortion). */
 static void
 fill_asbd(AudioStreamBasicDescription *d, Boolean integer)
 {
@@ -896,12 +898,12 @@ A5_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 		case kAudioStreamPropertyVirtualFormat:
 			fill_asbd(d, false); return 0;
 		case kAudioStreamPropertyPhysicalFormat:
-			fill_asbd(d, true); return 0;
+			fill_asbd(d, false); return 0;
 		case kAudioStreamPropertyAvailableVirtualFormats:
 		case kAudioStreamPropertyAvailablePhysicalFormats: {
 			AudioStreamRangedDescription *r = d;
 			for (int i = 0; i < 2; i++) {
-				fill_asbd(&r[i].mFormat, a->mSelector == kAudioStreamPropertyAvailablePhysicalFormats);
+				fill_asbd(&r[i].mFormat, false);
 				r[i].mFormat.mSampleRate = i ? 48000.0 : 44100.0;
 				r[i].mSampleRateRange.mMinimum = r[i].mSampleRateRange.mMaximum = r[i].mFormat.mSampleRate;
 			}
