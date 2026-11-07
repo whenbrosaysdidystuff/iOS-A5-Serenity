@@ -18,6 +18,7 @@
 #define A5_kAudioDevicePropertyBufferFrameSizeRange 'fsz#'
 #define A5_kAudioDevicePropertyStreamConfiguration  'slay'
 static AudioObjectID rdp(AudioObjectID o, const AudioObjectPropertyAddress *a);
+static int gRedirect;
 
 typedef OSStatus (*GetDataFn)(AudioObjectID, const AudioObjectPropertyAddress *, UInt32, const void *, UInt32 *, void *);
 typedef OSStatus (*GetSizeFn)(AudioObjectID, const AudioObjectPropertyAddress *, UInt32, const void *, UInt32 *);
@@ -56,9 +57,80 @@ spy_log(const char *fn, AudioObjectID o, const AudioObjectPropertyAddress *a, lo
 	os_unfair_lock_unlock(&gSpyLock);
 }
 
+/* deep copy of a property list with every "Null_Device" string replaced by the A5 device UID */
+static CFTypeRef
+swap_null(CFTypeRef v, int *hits)
+{
+	if (!v) {
+		return NULL;
+	}
+	CFTypeID t = CFGetTypeID(v);
+	if (t == CFStringGetTypeID()) {
+		if (CFEqual(v, CFSTR("Null_Device"))) {
+			(*hits)++;
+			return CFRetain(gUID);
+		}
+		return CFRetain(v);
+	}
+	if (t == CFArrayGetTypeID()) {
+		CFIndex n = CFArrayGetCount(v);
+		CFMutableArrayRef m = CFArrayCreateMutable(NULL, n, &kCFTypeArrayCallBacks);
+		for (CFIndex i = 0; i < n; i++) {
+			CFTypeRef e = swap_null(CFArrayGetValueAtIndex(v, i), hits);
+			CFArrayAppendValue(m, e);
+			CFRelease(e);
+		}
+		return m;
+	}
+	if (t == CFDictionaryGetTypeID()) {
+		CFIndex n = CFDictionaryGetCount(v);
+		const void *ks[64], *vs[64];
+		if (n > 64) {
+			return CFRetain(v);
+		}
+		CFDictionaryGetKeysAndValues(v, ks, vs);
+		CFMutableDictionaryRef m = CFDictionaryCreateMutable(NULL, n, &kCFTypeDictionaryKeyCallBacks,
+		    &kCFTypeDictionaryValueCallBacks);
+		for (CFIndex i = 0; i < n; i++) {
+			CFTypeRef e = swap_null(vs[i], hits);
+			CFDictionarySetValue(m, ks[i], e);
+			CFRelease(e);
+		}
+		return m;
+	}
+	return CFRetain(v);
+}
+
+static void
+log_plist(const char *tag, CFTypeRef v)
+{
+	char buf[1500];
+	CFStringRef d = v ? CFCopyDescription(v) : NULL;
+	if (d && CFStringGetCString(d, buf, sizeof(buf), kCFStringEncodingUTF8)) {
+		trace("%s %s\n", tag, buf);
+	}
+	if (d) {
+		CFRelease(d);
+	}
+}
+
 static OSStatus
 spy_get(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 *sz, void *d)
 {
+	if (gRedirect && a && a->mSelector == 'cagg' && q && qs == sizeof(CFDictionaryRef)) {
+		int hits = 0;
+		CFTypeRef desc = *(const CFTypeRef *)q;
+		log_plist("cagg in:", desc);
+		CFTypeRef nd = swap_null(desc, &hits);
+		if (hits) {
+			log_plist("cagg out:", nd);
+			OSStatus r = real_get(o, a, qs, &nd, sz, d);
+			spy_log("get-cagg-swapped", o, a, r, (sz && *sz >= 4 && d) ? *(UInt32 *)d : 0);
+			CFRelease(nd);
+			return r;
+		}
+		CFRelease(nd);
+	}
 	UInt32 in = sz ? *sz : 0;
 	OSStatus r = real_get(rdp(o, a), a, qs, q, sz, d);
 	UInt32 v = (r == 0 && sz && *sz >= 4 && d) ? *(UInt32 *)d : in;
@@ -124,7 +196,6 @@ static TimeFn real_curtime;
 static NearestFn real_nearest;
 static TranslateFn real_translate;
 static RemoveListenerFn real_unlisten;
-static int gRedirect;
 static AudioObjectID gNullDev, gNullOut, gNullIn, gMyDev, gMyOut, gMyIn;
 
 static AudioObjectID
