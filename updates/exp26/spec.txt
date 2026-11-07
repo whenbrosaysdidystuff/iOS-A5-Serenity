@@ -1,0 +1,10 @@
+# Experiment 26: what happens on a volume press. exp25's volume control is found by VirtualAudio
+# ('vdb#' output element 4 now answers) but nothing ever sets it: the route still goes to the
+# null port (pnul), whose volume properties are empty. Same plug-in; this collects the unified
+# logs so VirtualAudio's volume handling on button presses can be read.
+REMOVE  /private/var/mobile/Library/Logs/a5/a5audio.log
+KILL    mediaserverd
+COLLECT /private/var/mobile/Library/Logs/a5 4096
+COLLECT /private/var/db/diagnostics/timesync 2048
+COLLECT /private/var/db/diagnostics/Persist 12288
+COLLECT /private/var/db/diagnostics/Special 4096
