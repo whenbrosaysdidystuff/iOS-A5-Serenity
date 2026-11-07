@@ -1,0 +1,43 @@
+diff --git a/bsd/dev/sweet_a5_keys.c b/bsd/dev/sweet_a5_keys.c
+index c900a67..31e5b32 100644
+--- a/bsd/dev/sweet_a5_keys.c
++++ b/bsd/dev/sweet_a5_keys.c
+@@ -22,7 +22,9 @@
+  * Also the wall clock: the SC2730 RTC (PMIC 0x200, Linux rtc-sc27xx.c: SEC/MIN/HOUR
+  * counters 0x0/0x4/0x8, DAY counter 0xc = days since 1970-01-01, UTC as Android keeps
+  * it) is read once, read-only, and the kernel calendar set from it before launchd
+- * runs. Boot-arg a5rtc=0 disables it.
++ * runs. Boot-arg a5rtc=0 disables it. Android does not keep real time in this RTC (it stores
++ * its own offset on userdata): boot-arg a5rtcoff=N (seconds) is added to the RTC value
++ * (on the user's A5 the RTC ran 511 days behind).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -182,9 +184,10 @@ rtc_read(uint64_t *secs)
+ static void
+ rtc_sync(void)
+ {
+-	uint32_t on = 1;
++	uint32_t on = 1, off = 0;
+ 	uint64_t a = 0, b = 0;
+ 	PE_parse_boot_argn("a5rtc", &on, sizeof(on));
++	PE_parse_boot_argn("a5rtcoff", &off, sizeof(off));
+ 	if (!on) {
+ 		return;
+ 	}
+@@ -197,12 +200,14 @@ rtc_sync(void)
+ 			break;
+ 		}
+ 	}
++	a += off;
++	b += off;
+ 	if (a != b || a < RTC_2024 || a > RTC_2100) {
+ 		printf("SWEET A5 RTC: implausible value %llu (%llu), clock not set\n", a, b);
+ 		return;
+ 	}
+ 	clock_set_calendar_microtime((clock_sec_t)a, 0);
+-	printf("SWEET A5 RTC: %llu s since 1970 (UTC), calendar set\n", a);
++	printf("SWEET A5 RTC: %llu s since 1970 (UTC, RTC + %u), calendar set\n", a, off);
+ }
+ 
+ void
