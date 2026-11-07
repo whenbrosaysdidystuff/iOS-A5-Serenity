@@ -1,0 +1,6 @@
+# Experiment 1: VirtualAudio back on, with A5Audio presenting itself as the "Codec" device.
+RENAME  /Library/Audio/Plug-Ins/HAL.disabled/VirtualAudio.plugin /Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin
+FILE    a5audio.conf /private/var/db/a5audio.conf 0644 0 0
+KILL    mediaserverd
+COLLECT /private/var/mobile/Library/Logs/a5 2048
+COLLECT /private/var/mobile/Library/Logs/CrashReporter 128
