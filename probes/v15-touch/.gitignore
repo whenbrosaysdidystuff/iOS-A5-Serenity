@@ -1,0 +1,5 @@
+fw.bin
+*.o
+*.elf
+Image
+*.img
