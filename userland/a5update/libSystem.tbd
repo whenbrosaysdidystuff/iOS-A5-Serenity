@@ -1,0 +1,13 @@
+--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-ios ]
+install-name: '/usr/lib/libSystem.B.dylib'
+current-version: 1319
+exports:
+  - targets: [ arm64-ios ]
+    symbols: [ ___error, ___memcpy_chk, _calloc, _chmod, _chown, _close, _closedir, _fchmod, _fchown,
+               _free, _fsync, _getpid, _kill, _lstat, _malloc, _memcpy, _memset, _bzero, _mkdir, _open,
+               _opendir, _pread, _pwrite, _read, _readdir, _rename, _rmdir, _sleep, _snprintf, _stat,
+               _strcmp, _strerror, _strlcpy, _strlen, _strncmp, _strrchr, _symlink, _sync, _sysctl,
+               _unlink, _vsnprintf, _write, dyld_stub_binder ]
+...

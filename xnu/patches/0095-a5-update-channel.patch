@@ -1,0 +1,174 @@
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index eed3c94..b7c16a9 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -33,6 +33,13 @@
+  * default 20, so the screen can be photographed). emmcwtest=1 (with emmcrw=1
+  * and emmcroot=blackbox) adds a write test on 256 KiB at blackbox + 256 MiB:
+  * save, write a pattern, read back, restore the saved data, read back.
++ *
++ * /dev/a5update (root only, 0600): the "blackbox" partition as an update and log channel for
++ * userland bring-up (userland/a5update). Reads cover the update area, blackbox + 0 .. 256 MiB
++ * (written from the PC with `fastboot flash blackbox`). Writes are accepted only in the log
++ * area, blackbox + 256 MiB .. 320 MiB (read back on the PC with spd_dump read_part). Device
++ * offsets are blackbox byte offsets. This needs no emmcrw: nothing outside that 64 MiB window
++ * can be written through it (emmc_write_allowed). Boot-arg a5update=0 disables it.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -211,10 +218,28 @@ sd_cmd(uint16_t cmd, uint32_t arg, uint32_t *r1)
+ 
+ static const char *const WRITABLE_PARTS[] = { "userdata", "blackbox" };
+ 
++/* /dev/a5update: blackbox bounds and windows (bytes, relative to the partition) */
++#define A5UP_UPDATE_LEN (256ull << 20)
++#define A5UP_LOG_OFF    (256ull << 20)
++#define A5UP_LOG_LEN    (64ull << 20)
++static uint64_t a5up_first, a5up_nsect;
++static bool a5up_ready;
++
++static bool
++a5up_log_window(uint64_t lba, uint32_t count)
++{
++	uint64_t lo = a5up_first + A5UP_LOG_OFF / SECTOR, n = A5UP_LOG_LEN / SECTOR;
++	return a5up_ready && count && a5up_nsect * SECTOR >= A5UP_LOG_OFF + A5UP_LOG_LEN &&
++	       lba >= lo && lba - lo < n && count <= n - (lba - lo);
++}
++
+ /* The only gate for data going out: inside the partition, writes enabled. */
+ static bool
+ emmc_write_allowed(uint64_t lba, uint32_t count)
+ {
++	if (a5up_log_window(lba, count)) {
++		return true;
++	}
+ 	return se.writable && se.ready && se.nsect && count && lba >= se.first &&
+ 	       lba - se.first < se.nsect && count <= se.nsect - (lba - se.first);
+ }
+@@ -719,6 +744,118 @@ static const struct cdevsw sweet_emmc_cdevsw = {
+ 	.d_type       = D_DISK,
+ };
+ 
++/* ---- /dev/a5update */
++static int
++a5up_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return a5up_ready ? 0 : ENXIO;
++}
++
++static int
++a5up_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++a5up_rw(struct uio *uio, bool write)
++{
++	int error = 0;
++	lck_mtx_lock(&sweet_emmc_lock);
++	while (uio_resid(uio) > 0) {
++		off_t off = uio_offset(uio);
++		uint64_t lo = write ? A5UP_LOG_OFF : 0, hi = write ? A5UP_LOG_OFF + A5UP_LOG_LEN : A5UP_UPDATE_LEN;
++		if (off < 0 || (uint64_t)off < lo || (uint64_t)off >= hi || (uint64_t)off >= a5up_nsect * SECTOR) {
++			error = (write || off < 0) ? EINVAL : 0;
++			break;
++		}
++		uint32_t skip = (uint32_t)(off % SECTOR);
++		uint64_t room = hi - (uint64_t)off;
++		uint32_t want = (uint32_t)MIN(MIN((uint64_t)uio_resid(uio), room), (uint64_t)(BOUNCE_SIZE - skip));
++		uint32_t blocks = (skip + want + SECTOR - 1) / SECTOR;
++		uint64_t lba = a5up_first + (uint64_t)off / SECTOR;
++		if (!write || skip || ((skip + want) % SECTOR)) {
++			error = sd_read_retry(lba, blocks);
++			if (error) {
++				break;
++			}
++		}
++		error = uiomove((caddr_t)se.dma + skip, (int)want, uio);
++		if (error) {
++			break;
++		}
++		if (write) {
++			error = sd_write(lba, blocks);
++			if (error) {
++				break;
++			}
++		}
++	}
++	lck_mtx_unlock(&sweet_emmc_lock);
++	return error;
++}
++
++static int
++a5up_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return a5up_rw(uio, false);
++}
++
++static int
++a5up_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return a5up_rw(uio, true);
++}
++
++static const struct cdevsw a5up_cdevsw = {
++	.d_open       = a5up_open,
++	.d_close      = a5up_close,
++	.d_read       = a5up_read,
++	.d_write      = a5up_write,
++	.d_ioctl      = eno_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++/* Find blackbox (the root partition's bounds in se stay as they are) and publish /dev/a5update. */
++static void
++a5up_init(void)
++{
++	uint32_t on = 1;
++	PE_parse_boot_argn("a5update", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	lck_mtx_lock(&sweet_emmc_lock);
++	uint64_t f = se.first, n = se.nsect;
++	int error = emmc_find_partition("blackbox", false);
++	if (!error) {
++		a5up_first = se.first;
++		a5up_nsect = se.nsect;
++	}
++	se.first = f;
++	se.nsect = n;
++	lck_mtx_unlock(&sweet_emmc_lock);
++	if (error || a5up_nsect * SECTOR < A5UP_LOG_OFF + A5UP_LOG_LEN) {
++		printf("SWEET EMMC: no /dev/a5update (blackbox: %d, %llu MiB)\n", error, a5up_nsect >> 11);
++		return;
++	}
++	int major = cdevsw_add(-1, &a5up_cdevsw);
++	if (major < 0) {
++		return;
++	}
++	devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "a5update");
++	a5up_ready = true;
++	printf("SWEET EMMC: /dev/a5update = blackbox (first LBA 0x%llx): update 0-256 MiB, log 256-320 MiB\n", a5up_first);
++}
++
+ static int
+ sweet_emmc_init(void)
+ {
+@@ -764,6 +901,7 @@ sweet_emmc_init(void)
+ 	se.writable = (rw == 1) && allowed;
+ 	printf("SWEET EMMC: \"%s\": first LBA 0x%llx, %llu MiB, %s\n",
+ 	    se.part, se.first, se.nsect >> 11, se.writable ? "read-write" : "read-only");
++	a5up_init();
+ 	/* A5 input: the buttons (bsd/dev/sweet_a5_keys.c) start with the root device */
+ 	sweet_a5_keys_init();
+ 	sweet_a5_touch_init();
