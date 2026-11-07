@@ -1,0 +1,6 @@
+# Experiment 24: recording test. 48 kHz, pitch reference tones on (440 Hz direct + 440 Hz through the
+# ring), so a phone/PC recording of the tones and of an iOS sound can be measured.
+FILE    a5audio.conf /private/var/db/a5audio.conf 0644 0 0
+REMOVE  /private/var/mobile/Library/Logs/a5/a5audio.log
+KILL    mediaserverd
+COLLECT /private/var/mobile/Library/Logs/a5 4096
