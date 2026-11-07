@@ -12,11 +12,12 @@ SRC is a file on this computer, relative to the SPEC's folder):
   SYMLINK PATH TARGET
   COLLECT PATH [KIB]                  copy a file / a directory's files into the log (default 256 KiB each)
   KILL    NAME [SIGNAL]               default 15; launchd restarts daemons
+  LIST    PATH                        log a directory listing (every boot)
 The serial is the build time, so every new image is applied once.
 """
 import os, struct, sys, time, zlib
 
-OPS = {'FILE': 1, 'DIR': 2, 'RENAME': 3, 'REMOVE': 4, 'SYMLINK': 5, 'COLLECT': 6, 'KILL': 7}
+OPS = {'FILE': 1, 'DIR': 2, 'RENAME': 3, 'REMOVE': 4, 'SYMLINK': 5, 'COLLECT': 6, 'KILL': 7, 'LIST': 8}
 
 
 def entry(op, path, data=b'', mode=0, uid=0, gid=0):
@@ -54,6 +55,8 @@ def main():
             entries.append(entry(4, a[0]))
         elif op == 'COLLECT':
             entries.append(entry(6, a[0], b'', int(a[1]) if len(a) > 1 else 0))
+        elif op == 'LIST':
+            entries.append(entry(8, a[0]))
         elif op == 'KILL':
             entries.append(entry(7, a[0], b'', int(a[1]) if len(a) > 1 else 15))
     payload = b''.join(entries)

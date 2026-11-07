@@ -15,11 +15,13 @@
  *     op 6 COLLECT copy path (file, or every file in a directory) into the log, newest data at most
  *                  `mode` KiB each (0 = 256), after 30 s, 120 s and 300 s
  *     op 7 KILL    send signal `mode` to every process named path (launchd restarts daemons)
+ *     op 8 LIST    log a listing of directory path (every boot, before collecting)
  * An image is applied once: its serial is kept in /private/var/db/a5update.serial. COLLECT and the
  * log run every boot.
  *
  * Log area: "A5LOG001", u32 length, then text: what was applied, then "=== path (n bytes) ===" +
- * contents for every collected file. tools/a5log.py prints it.
+ * contents for every collected file. tools/a5log.py prints it. The last 4 MiB of earlier boots'
+ * logs are kept in /private/var/db/a5update.history and come first.
  * Sounds (/dev/a5audio): two short high beeps = update applied, one low beep = update failed.
  */
 #include <fcntl.h>
@@ -33,6 +35,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <time.h>
 
 #define DEV             "/dev/a5update"
 #define SERIAL_PATH     "/private/var/db/a5update.serial"
@@ -40,6 +43,8 @@
 #define LOG_MAX         (64u << 20)
 #define MAX_PAYLOAD     (200u << 20)
 #define MAX_COLLECT     32
+#define HISTORY_PATH    "/private/var/db/a5update.history"
+#define HISTORY_MAX     (4u << 20)
 
 struct hdr {
 	char magic[8];
@@ -253,6 +258,59 @@ static struct {
 	unsigned int max;
 } collect[MAX_COLLECT];
 static int ncollect;
+static char lists[16][512];
+static int nlists;
+
+static void
+list_dir(const char *path)
+{
+	DIR *d = opendir(path);
+	logf_("=== ls %s%s ===\n", path, d ? "" : ": cannot open");
+	if (!d) {
+		return;
+	}
+	struct dirent *e;
+	while ((e = readdir(d))) {
+		char sub[1024];
+		struct stat st;
+		snprintf(sub, sizeof(sub), "%s/%s", path, e->d_name);
+		if (lstat(sub, &st)) {
+			logf_("  ? %s\n", e->d_name);
+		} else {
+			logf_("  %06o %u:%u %10lld %s\n", st.st_mode, st.st_uid, st.st_gid, (long long)st.st_size, e->d_name);
+		}
+	}
+	closedir(d);
+}
+
+static void
+history_load(void)
+{
+	int fd = open(HISTORY_PATH, O_RDONLY);
+	if (fd < 0) {
+		return;
+	}
+	struct stat st;
+	if (!fstat(fd, &st) && st.st_size > 0) {
+		off_t start = st.st_size > HISTORY_MAX ? st.st_size - HISTORY_MAX : 0;
+		ssize_t r = pread(fd, logbuf, (size_t)(st.st_size - start), start);
+		if (r > 0) {
+			loglen = (unsigned)r;
+		}
+	}
+	close(fd);
+}
+
+static void
+history_save(void)
+{
+	unsigned int start = loglen > HISTORY_MAX ? loglen - HISTORY_MAX : 0;
+	int fd = open(HISTORY_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd >= 0) {
+		(void)write(fd, logbuf + start, loglen - start);
+		close(fd);
+	}
+}
 
 static void
 collect_file(const char *path, unsigned int max)
@@ -380,6 +438,11 @@ apply(const unsigned char *pl, unsigned int len, unsigned int count, int dry)
 			continue;
 		case 7:
 			continue;               /* after everything else */
+		case 8:
+			if (nlists < 16) {
+				strlcpy(lists[nlists++], path, sizeof(lists[0]));
+			}
+			continue;
 		default:
 			e = EINVAL;
 		}
@@ -417,7 +480,8 @@ main(void)
 	if (!logbuf) {
 		return 1;
 	}
-	logf_("a5update pid %d\n", getpid());
+	history_load();
+	logf_("\n######## boot: a5update pid %d, time %ld ########\n", getpid(), (long)time(NULL));
 	int fd = open(DEV, O_RDONLY);
 	if (fd < 0) {
 		logf_("open %s: %s\n", DEV, strerror(errno));
@@ -446,6 +510,10 @@ main(void)
 			for (unsigned int i = 0; i < h.count; i++) {
 				unsigned int e[6];
 				memcpy(e, pl + off, 24);
+				if (e[0] == 8 && nlists < 16 && e[4] < 512) {
+					memcpy(lists[nlists], pl + off + 24, e[4]);
+					lists[nlists++][e[4]] = 0;
+				}
 				if (e[0] == 6 && ncollect < MAX_COLLECT) {
 					memcpy(collect[ncollect].path, pl + off + 24, e[4]);
 					collect[ncollect].path[e[4]] = 0;
@@ -472,6 +540,9 @@ main(void)
 		logf_("no update image\n");
 	}
 	close(fd);
+	for (int i = 0; i < nlists; i++) {
+		list_dir(lists[i]);
+	}
 	log_flush();
 	static const unsigned int waits[3] = { 30, 90, 180 };
 	for (int r = 0; r < 3 && ncollect; r++) {
@@ -479,5 +550,6 @@ main(void)
 		collect_all(r + 1);
 		log_flush();
 	}
+	history_save();
 	return 0;
 }

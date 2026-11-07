@@ -20,6 +20,9 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <os/lock.h>
 
 #define kObjectID_PlugIn        kAudioObjectPlugInObject
 #define kObjectID_Device        2
@@ -42,6 +45,63 @@ static UInt64 gAnchorHostTime;
 static UInt64 gNumberTimeStamps;
 static Float32 gVolume = 1.0f;          /* reserved for a volume control */
 static CFStringRef gUID, gName, gModel;
+
+/* trace of what the HAL / VirtualAudio asks this driver, each distinct request once:
+ * /private/var/mobile/Library/Logs/a5/a5audio.log (collected by a5update) */
+static os_unfair_lock gTraceLock = OS_UNFAIR_LOCK_INIT;
+static int gTraceFd = -1;
+static UInt64 gSeen[1024];
+static UInt32 gSeenN;
+
+static void
+trace(const char *fmt, ...)
+{
+	char line[512];
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	if (n <= 0) {
+		return;
+	}
+	if (gTraceFd < 0) {
+		gTraceFd = open("/private/var/mobile/Library/Logs/a5/a5audio.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+	}
+	if (gTraceFd >= 0) {
+		(void)write(gTraceFd, line, (size_t)(n < (int)sizeof(line) ? n : (int)sizeof(line) - 1));
+	}
+}
+
+static const char *
+fcc(UInt32 v, char *b)
+{
+	for (int i = 0; i < 4; i++) {
+		char c = (char)(v >> (24 - 8 * i));
+		b[i] = (c >= 32 && c < 127) ? c : '?';
+	}
+	b[4] = 0;
+	return b;
+}
+
+/* log a property request the first time it is seen */
+static void
+trace_prop(const char *what, AudioObjectID o, const AudioObjectPropertyAddress *a, OSStatus st)
+{
+	UInt64 key = ((UInt64)a->mSelector << 32) ^ ((UInt64)a->mScope << 8) ^ ((UInt64)o << 3) ^ (UInt64)(what[0] + (st ? 1 : 0));
+	os_unfair_lock_lock(&gTraceLock);
+	for (UInt32 i = 0; i < gSeenN; i++) {
+		if (gSeen[i] == key) {
+			os_unfair_lock_unlock(&gTraceLock);
+			return;
+		}
+	}
+	if (gSeenN < 1024) {
+		gSeen[gSeenN++] = key;
+	}
+	char s1[5], s2[5];
+	trace("%s obj %u '%s' scope '%s' elem %u -> %d\n", what, o, fcc(a->mSelector, s1), fcc(a->mScope, s2), a->mElement, (int)st);
+	os_unfair_lock_unlock(&gTraceLock);
+}
 static int gBeep = 1;
 
 static void
@@ -237,6 +297,7 @@ A5_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHo
 	Float64 hostHz = 1e9 * (Float64)tb.denom / (Float64)tb.numer;
 	gHostTicksPerFrame = hostHz / kSampleRate;
 	read_conf();
+	trace("--- A5Audio Initialize (pid %d)\n", getpid());
 	if (gBeep) {
 		hello_beep();
 	}
@@ -245,7 +306,18 @@ A5_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHo
 
 static OSStatus A5_CreateDevice(AudioServerPlugInDriverRef d, CFDictionaryRef a, const AudioServerPlugInClientInfo *c, AudioObjectID *o) { (void)d; (void)a; (void)c; (void)o; return kAudioHardwareUnsupportedOperationError; }
 static OSStatus A5_DestroyDevice(AudioServerPlugInDriverRef d, AudioObjectID o) { (void)d; (void)o; return kAudioHardwareUnsupportedOperationError; }
-static OSStatus A5_AddDeviceClient(AudioServerPlugInDriverRef d, AudioObjectID o, const AudioServerPlugInClientInfo *c) { (void)d; (void)o; (void)c; return 0; }
+static OSStatus
+A5_AddDeviceClient(AudioServerPlugInDriverRef d, AudioObjectID o, const AudioServerPlugInClientInfo *c)
+{
+	char id[256] = "?";
+	(void)d;
+	if (c && c->mBundleID) {
+		CFStringGetCString(c->mBundleID, id, sizeof(id), kCFStringEncodingUTF8);
+	}
+	trace("client add obj %u id %u pid %d native %d bundle %s\n", o, c ? c->mClientID : 0, c ? c->mProcessID : 0,
+	    c ? c->mIsNativeEndian : 0, id);
+	return 0;
+}
 static OSStatus A5_RemoveDeviceClient(AudioServerPlugInDriverRef d, AudioObjectID o, const AudioServerPlugInClientInfo *c) { (void)d; (void)o; (void)c; return 0; }
 static OSStatus A5_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef d, AudioObjectID o, UInt64 a, void *i) { (void)d; (void)o; (void)a; (void)i; return 0; }
 static OSStatus A5_AbortDeviceConfigurationChange(AudioServerPlugInDriverRef d, AudioObjectID o, UInt64 a, void *i) { (void)d; (void)o; (void)a; (void)i; return 0; }
@@ -276,8 +348,19 @@ A5_IsPropertySettable(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjec
 }
 
 /* size of each property; also the "has property" test */
+static OSStatus A5_GetPropertyDataSize_(AudioServerPlugInDriverRef, AudioObjectID, pid_t, const AudioObjectPropertyAddress *,
+    UInt32, const void *, UInt32 *);
 static OSStatus
 A5_GetPropertyDataSize(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a,
+    UInt32 qs, const void *q, UInt32 *out)
+{
+	OSStatus st = A5_GetPropertyDataSize_(inDriver, o, pid, a, qs, q, out);
+	trace_prop("query", o, a, st);
+	return st;
+}
+
+static OSStatus
+A5_GetPropertyDataSize_(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a,
     UInt32 qs, const void *q, UInt32 *out)
 {
 	(void)pid; (void)qs; (void)q;
@@ -484,6 +567,7 @@ A5_SetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 		const AudioStreamBasicDescription *f = d;
 		return f->mSampleRate == kSampleRate && f->mChannelsPerFrame == kChannels ? 0 : kAudioDeviceUnsupportedFormatError;
 	}
+	trace_prop("set", o, a, kAudioHardwareUnknownPropertyError);
 	return kAudioHardwareUnknownPropertyError;
 }
 
@@ -495,6 +579,7 @@ A5_StartIO(AudioServerPlugInDriverRef inDriver, AudioObjectID o, UInt32 client)
 	if (inDriver != gDriverRef || o != kObjectID_Device) {
 		return kAudioHardwareBadObjectError;
 	}
+	trace("StartIO client %u (io count %u)\n", client, gIOCount);
 	if (gIOCount++ == 0) {
 		open_dev();
 		gNumberTimeStamps = 0;
@@ -510,6 +595,7 @@ A5_StopIO(AudioServerPlugInDriverRef inDriver, AudioObjectID o, UInt32 client)
 	if (inDriver != gDriverRef || o != kObjectID_Device) {
 		return kAudioHardwareBadObjectError;
 	}
+	trace("StopIO client %u\n", client);
 	if (gIOCount > 0 && --gIOCount == 0) {
 		close_dev();
 	}

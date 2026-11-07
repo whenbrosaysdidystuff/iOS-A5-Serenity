@@ -1,0 +1,6 @@
+# Experiment 2: A5Audio with a request trace (what VirtualAudio asks the "Codec" device), a5update
+# with log history and LIST. Still VirtualAudio on (exp1). Binaries come from the build outputs.
+FILE    ../../userland/A5Audio/out/A5Audio.driver/A5Audio /System/Library/Audio/Plug-Ins/HAL/A5Audio.driver/A5Audio 0755 0 0
+FILE    ../../userland/a5update/out/a5update /usr/libexec/a5update 0755 0 0
+KILL    mediaserverd
+COLLECT /private/var/mobile/Library/Logs/a5 2048

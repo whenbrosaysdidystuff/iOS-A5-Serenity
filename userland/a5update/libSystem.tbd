@@ -9,5 +9,5 @@ exports:
                _free, _fsync, _getpid, _kill, _lstat, _malloc, _memcpy, _memset, _bzero, _mkdir, _open,
                _opendir, _pread, _pwrite, _read, _readdir, _rename, _rmdir, _sleep, _snprintf, _stat,
                _strcmp, _strerror, _strlcpy, _strlen, _strncmp, _strrchr, _symlink, _sync, _sysctl,
-               _unlink, _vsnprintf, _write, dyld_stub_binder ]
+               _unlink, _vsnprintf, _write, _fstat, _time, dyld_stub_binder ]
 ...
