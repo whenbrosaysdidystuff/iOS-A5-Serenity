@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key><string>en</string>
+	<key>CFBundleExecutable</key><string>A5Audio</string>
+	<key>CFBundleIdentifier</key><string>org.a5port.audio.A5Audio</string>
+	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+	<key>CFBundleName</key><string>A5Audio</string>
+	<key>CFBundlePackageType</key><string>BNDL</string>
+	<key>CFBundleShortVersionString</key><string>1.0</string>
+	<key>CFBundleVersion</key><string>1</string>
+	<key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
+	<key>MinimumOSVersion</key><string>16.0</string>
+	<key>UIDeviceFamily</key><array><integer>1</integer></array>
+	<key>CFPlugInFactories</key>
+	<dict>
+		<key>5A0A5A0A-1D7E-4A55-9A05-A5A5A0D10001</key><string>A5Audio_Create</string>
+	</dict>
+	<key>CFPlugInTypes</key>
+	<dict>
+		<key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+		<array><string>5A0A5A0A-1D7E-4A55-9A05-A5A5A0D10001</string></array>
+	</dict>
+</dict>
+</plist>

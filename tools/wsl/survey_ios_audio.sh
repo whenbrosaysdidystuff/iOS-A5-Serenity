@@ -64,9 +64,9 @@ for c in System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_ca
 	System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64*; do
 	[[ -f $c ]] || continue
 	strings -n 8 "$c" | grep -E '^/System/Library/(Audio|PrivateFrameworks/[A-Za-z]*Audio|Frameworks/[A-Za-z]*Audio)' \
-		| sort -u | head -300 >> "$WIN/dyld.txt"
+		| sort -u | head -300 >> "$WIN/dyld.txt" || true
 	strings -n 8 "$c" | grep -E 'AppleAudio[A-Za-z0-9]*|IOAudio2[A-Za-z]*|AppleHALPlugIn|VirtualAudio[A-Za-z]*' -o \
-		| sort | uniq -c | sort -rn | head -200 >> "$WIN/dyld.txt"
+		| sort | uniq -c | sort -rn | head -200 >> "$WIN/dyld.txt" || true
 done
 wc -l "$WIN/dyld.txt"
 

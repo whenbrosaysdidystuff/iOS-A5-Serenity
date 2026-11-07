@@ -1,0 +1,10 @@
+--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-ios ]
+install-name: '/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation'
+current-version: 1953
+exports:
+  - targets: [ arm64-ios ]
+    symbols: [ _CFEqual, _CFRelease, _CFUUIDCreateFromUUIDBytes, _CFUUIDGetConstantUUIDWithBytes,
+               ___CFConstantStringClassReference, _kCFAllocatorSystemDefault ]
+...
