@@ -1,0 +1,8 @@
+# Experiment 25: speaker volume control (A5Audio object 7, 'vlme' on output element 4, -48..0 dB).
+# VirtualAudio asked for 'vdb#'/'volm' on output element 4 and found nothing, so the volume buttons
+# and slider had no effect. Pitch test and hello beep off. a5audio.conf vol=0 hides the control.
+FILE    ../../userland/A5Audio/out/A5Audio.driver/A5Audio /System/Library/Audio/Plug-Ins/HAL/A5Audio.driver/A5Audio 0755 0 0
+FILE    a5audio.conf /private/var/db/a5audio.conf 0644 0 0
+REMOVE  /private/var/mobile/Library/Logs/a5/a5audio.log
+KILL    mediaserverd
+COLLECT /private/var/mobile/Library/Logs/a5 4096

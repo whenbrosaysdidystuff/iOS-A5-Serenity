@@ -33,6 +33,11 @@
 #define kObjectID_InSource      5       /* input data source control (the HAL derives ssc#/ssrc from it) */
 #define kObjectID_SpkMute       6       /* mute control, output element 4: VirtualAudio's Device_Codec_Aspen
                                          * creates its speaker port only if 'mute'/output/4 exists */
+#define kObjectID_SpkVolume     7       /* volume control, output element 4: VirtualAudio looks up the speaker
+                                         * port's volume as 'vdb#'/'volm' on output element 4; without it the
+                                         * volume buttons and slider change nothing */
+#define kVolMinDB               (-48.0f)
+#define kVolMaxDB               0.0f
 #define kSpeakerElement         4
 /* macOS-only names in the SDK headers (same values on iOS) */
 #define kAudioDevicePropertyDataSource                  'ssrc'
@@ -56,7 +61,9 @@ static Float64 gHostTicksPerFrame, gHostHz;
 static Float64 gRate = kSampleRate, gPendingRate = kSampleRate;
 static UInt64 gAnchorHostTime;
 static UInt64 gNumberTimeStamps;
-static Float32 gVolume = 1.0f;          /* reserved for a volume control */
+static Float32 gVolume = 1.0f;          /* linear gain from the volume control */
+static Float32 gVolScalar = 1.0f;       /* the control's scalar value, 0..1 */
+static int gVolCtl = 1;                 /* a5audio.conf vol=0 hides the volume control */
 static CFStringRef gUID, gName, gModel;
 
 /* iOS-private device properties VirtualAudio's Device_Codec_Aspen listens to (any scope):
@@ -78,15 +85,51 @@ static UInt32 gSpkMuted;
 static UInt32
 owned(AudioObjectPropertyScope sc, AudioObjectID *list)
 {
-	static const AudioObjectID all[4] = { kObjectID_Stream, kObjectID_StreamIn, kObjectID_InSource, kObjectID_SpkMute };
-	static const AudioObjectID out[2] = { kObjectID_Stream, kObjectID_SpkMute };
+	static const AudioObjectID all[5] = { kObjectID_Stream, kObjectID_StreamIn, kObjectID_InSource, kObjectID_SpkMute,
+	    kObjectID_SpkVolume };
+	static const AudioObjectID out[3] = { kObjectID_Stream, kObjectID_SpkMute, kObjectID_SpkVolume };
 	static const AudioObjectID in[2] = { kObjectID_StreamIn, kObjectID_InSource };
 	const AudioObjectID *l = sc == kAudioObjectPropertyScopeOutput ? out : sc == kAudioObjectPropertyScopeInput ? in : all;
-	UInt32 n = sc == kAudioObjectPropertyScopeOutput || sc == kAudioObjectPropertyScopeInput ? 2 : 4;
+	UInt32 n = sc == kAudioObjectPropertyScopeOutput ? 2 + gVolCtl : sc == kAudioObjectPropertyScopeInput ? 2 : 4 + gVolCtl;
 	if (list) {
 		memcpy(list, l, n * sizeof(AudioObjectID));
 	}
 	return n;
+}
+
+/* volume curve: scalar 0..1 is linear in dB over kVolMinDB..kVolMaxDB; scalar 0 is silence */
+static Float32
+vol_s2db(Float32 v)
+{
+	v = v < 0 ? 0 : v > 1 ? 1 : v;
+	return kVolMinDB + v * (kVolMaxDB - kVolMinDB);
+}
+static Float32
+vol_db2s(Float32 db)
+{
+	db = db < kVolMinDB ? kVolMinDB : db > kVolMaxDB ? kVolMaxDB : db;
+	return (db - kVolMinDB) / (kVolMaxDB - kVolMinDB);
+}
+/* 10^(dB/20) without libm: e^(y/16) by a short series, squared four times */
+static Float32
+db_to_gain(Float32 db)
+{
+	double y = db * 0.11512925464970229 / 16.0, t = 1.0, e = 1.0;
+	for (int k = 1; k < 8; k++) {
+		t *= y / k;
+		e += t;
+	}
+	for (int k = 0; k < 4; k++) {
+		e *= e;
+	}
+	return (Float32)e;
+}
+static void
+vol_set(Float32 scalar)
+{
+	scalar = scalar < 0 ? 0 : scalar > 1 ? 1 : scalar;
+	gVolScalar = scalar;
+	gVolume = scalar <= 0.0f ? 0.0f : db_to_gain(vol_s2db(scalar));
 }
 
 static int
@@ -230,6 +273,8 @@ read_conf(void)
 					gRinger = eq[1] != '0';
 				} else if (!strcmp(l, "spy")) {
 					gSpy = eq[1] == '1';
+				} else if (!strcmp(l, "vol")) {
+					gVolCtl = eq[1] != '0';
 				} else if (!strcmp(l, "custom")) {
 					gDeclareCustom = eq[1] == '1';
 				}
@@ -611,6 +656,8 @@ A5_IsPropertySettable(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjec
 	    a->mSelector == kAudioDevicePropertyDataSource || extra_index(a->mSelector) >= 0)) ||
 	    (inObjectID == kObjectID_InSource && a->mSelector == kAudioSelectorControlPropertyCurrentItem) ||
 	    (inObjectID == kObjectID_SpkMute && a->mSelector == kAudioBooleanControlPropertyValue) ||
+	    (inObjectID == kObjectID_SpkVolume && (a->mSelector == kAudioLevelControlPropertyScalarValue ||
+	    a->mSelector == kAudioLevelControlPropertyDecibelValue)) ||
 	    ((inObjectID == kObjectID_Stream || inObjectID == kObjectID_StreamIn) && a->mSelector == kAudioStreamPropertyIsActive);
 	return 0;
 }
@@ -670,7 +717,7 @@ A5_GetPropertyDataSize_(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pi
 		case kAudioDevicePropertyStreams:
 			*out = (a->mScope == kAudioObjectPropertyScopeGlobal ? 2 : 1) * sizeof(AudioObjectID); return 0;
 		case kAudioObjectPropertyControlList:
-			*out = 2 * sizeof(AudioObjectID); return 0;
+			*out = (2 + gVolCtl) * sizeof(AudioObjectID); return 0;
 		case kAudioDevicePropertyRelatedDevices:
 			*out = sizeof(AudioObjectID); return 0;
 		case kAudioDevicePropertyTransportType:
@@ -720,6 +767,30 @@ A5_GetPropertyDataSize_(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pi
 		case kAudioControlPropertyElement:
 		case kAudioBooleanControlPropertyValue:
 			*out = sizeof(UInt32); return 0;
+		case kAudioObjectPropertyOwnedObjects:
+			*out = 0; return 0;
+		case kAudioObjectPropertyName:
+			*out = sizeof(CFStringRef); return 0;
+		}
+		break;
+	case kObjectID_SpkVolume:
+		if (!gVolCtl) {
+			return kAudioHardwareBadObjectError;
+		}
+		switch (a->mSelector) {
+		case kAudioObjectPropertyBaseClass:
+		case kAudioObjectPropertyClass:
+		case kAudioObjectPropertyOwner:
+		case kAudioControlPropertyScope:
+		case kAudioControlPropertyElement:
+			*out = sizeof(UInt32); return 0;
+		case kAudioLevelControlPropertyScalarValue:
+		case kAudioLevelControlPropertyDecibelValue:
+		case kAudioLevelControlPropertyConvertScalarToDecibels:
+		case kAudioLevelControlPropertyConvertDecibelsToScalar:
+			*out = sizeof(Float32); return 0;
+		case kAudioLevelControlPropertyDecibelRange:
+			*out = sizeof(AudioValueRange); return 0;
 		case kAudioObjectPropertyOwnedObjects:
 			*out = 0; return 0;
 		case kAudioObjectPropertyName:
@@ -827,7 +898,12 @@ A5_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 				}
 			}
 			return 0;
-		case kAudioObjectPropertyControlList: u[0] = kObjectID_InSource; u[1] = kObjectID_SpkMute; return 0;
+		case kAudioObjectPropertyControlList:
+			u[0] = kObjectID_InSource; u[1] = kObjectID_SpkMute;
+			if (gVolCtl) {
+				u[2] = kObjectID_SpkVolume;
+			}
+			return 0;
 		case kAudioDevicePropertyRelatedDevices: *u = kObjectID_Device; return 0;
 		case kAudioDevicePropertyTransportType: *u = kAudioDeviceTransportTypeBuiltIn; return 0;
 		case kAudioDevicePropertyClockDomain: *u = 0; return 0;
@@ -900,6 +976,27 @@ A5_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 		case kAudioObjectPropertyName: *(CFStringRef *)d = CFSTR("Speaker Mute"); return 0;
 		}
 		break;
+	case kObjectID_SpkVolume: {
+		Float32 *f = d;
+		switch (a->mSelector) {
+		case kAudioObjectPropertyBaseClass: *u = kAudioLevelControlClassID; return 0;
+		case kAudioObjectPropertyClass: *u = kAudioVolumeControlClassID; return 0;
+		case kAudioObjectPropertyOwner: *u = kObjectID_Device; return 0;
+		case kAudioControlPropertyScope: *u = kAudioObjectPropertyScopeOutput; return 0;
+		case kAudioControlPropertyElement: *u = kSpeakerElement; return 0;
+		case kAudioLevelControlPropertyScalarValue: *f = gVolScalar; return 0;
+		case kAudioLevelControlPropertyDecibelValue: *f = vol_s2db(gVolScalar); return 0;
+		case kAudioLevelControlPropertyDecibelRange:
+			((AudioValueRange *)d)->mMinimum = kVolMinDB;
+			((AudioValueRange *)d)->mMaximum = kVolMaxDB;
+			return 0;
+		/* conversions work in place on the caller's value */
+		case kAudioLevelControlPropertyConvertScalarToDecibels: *f = vol_s2db(*f); return 0;
+		case kAudioLevelControlPropertyConvertDecibelsToScalar: *f = vol_db2s(*f); return 0;
+		case kAudioObjectPropertyName: *(CFStringRef *)d = CFSTR("Speaker Volume"); return 0;
+		}
+		break;
+	}
 	case kObjectID_InSource:
 		switch (a->mSelector) {
 		case kAudioObjectPropertyBaseClass: *u = kAudioSelectorControlClassID; return 0;
@@ -964,6 +1061,20 @@ A5_SetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 		NEED(sizeof(UInt32));
 		gSpkMuted = *(const UInt32 *)d != 0;
 		trace_prop("set-ok", o, a, (OSStatus)gSpkMuted);
+		return 0;
+	}
+	if (o == kObjectID_SpkVolume && gVolCtl && (a->mSelector == kAudioLevelControlPropertyScalarValue ||
+	    a->mSelector == kAudioLevelControlPropertyDecibelValue)) {
+		NEED(sizeof(Float32));
+		Float32 v = *(const Float32 *)d;
+		vol_set(a->mSelector == kAudioLevelControlPropertyScalarValue ? v : vol_db2s(v));
+		trace("volume: %s %d/1000 -> scalar %d/1000, gain %d/1000\n",
+		    a->mSelector == kAudioLevelControlPropertyScalarValue ? "scalar" : "dB", (int)(v * 1000),
+		    (int)(gVolScalar * 1000), (int)(gVolume * 1000));
+		AudioObjectPropertyAddress ch[2] = {
+			{ kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster },
+			{ kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster } };
+		gHost->PropertiesChanged(gHost, kObjectID_SpkVolume, 2, ch);
 		return 0;
 	}
 	if (o == kObjectID_InSource && a->mSelector == kAudioSelectorControlPropertyCurrentItem) {
