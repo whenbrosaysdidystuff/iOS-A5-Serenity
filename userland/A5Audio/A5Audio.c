@@ -29,6 +29,7 @@
 #define kObjectID_Device        2
 #define kObjectID_Stream        3
 #define kObjectID_StreamIn      4       /* silent input: VirtualAudio requires the Codec to have one */
+#define kObjectID_InSource      5       /* input data source control (the HAL derives ssc#/ssrc from it) */
 /* macOS-only names in the SDK headers (same values on iOS) */
 #define kAudioDevicePropertyDataSource                  'ssrc'
 #define kAudioDevicePropertyDataSources                 'ssc#'
@@ -397,10 +398,9 @@ A5_IsPropertySettable(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjec
 	if (e) {
 		return e;
 	}
-	*out = false;
-	if (inObjectID == kObjectID_Device && a->mSelector == kAudioDevicePropertyNominalSampleRate) {
-		*out = true;            /* only the one rate is accepted */
-	}
+	*out = (inObjectID == kObjectID_Device && (a->mSelector == kAudioDevicePropertyNominalSampleRate ||
+	    a->mSelector == kAudioDevicePropertyDataSource || extra_index(a->mSelector) >= 0)) ||
+	    (inObjectID == kObjectID_InSource && a->mSelector == kAudioSelectorControlPropertyCurrentItem);
 	return 0;
 }
 
@@ -454,11 +454,14 @@ A5_GetPropertyDataSize_(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pi
 		case kAudioDevicePropertyModelUID:
 			*out = sizeof(CFStringRef); return 0;
 		case kAudioObjectPropertyOwnedObjects:
+			*out = (a->mScope == kAudioObjectPropertyScopeGlobal ? 3 : a->mScope == kAudioObjectPropertyScopeInput ? 2 : 1) *
+			    sizeof(AudioObjectID);
+			return 0;
 		case kAudioDevicePropertyStreams:
 			*out = (a->mScope == kAudioObjectPropertyScopeGlobal ? 2 : 1) * sizeof(AudioObjectID); return 0;
 		case kAudioObjectPropertyControlList:
 		case kAudioDevicePropertyRelatedDevices:
-			*out = (a->mSelector == kAudioDevicePropertyRelatedDevices) ? sizeof(AudioObjectID) : 0; return 0;
+			*out = sizeof(AudioObjectID); return 0;
 		case kAudioDevicePropertyTransportType:
 		case kAudioDevicePropertyClockDomain:
 		case kAudioDevicePropertyDeviceIsAlive:
@@ -495,6 +498,24 @@ A5_GetPropertyDataSize_(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pi
 		if (a->mSelector == kAudioObjectPropertyCustomPropertyInfoList && gDeclareCustom) {
 			*out = 4 * sizeof(AudioServerPlugInCustomPropertyInfo);
 			return 0;
+		}
+		break;
+	case kObjectID_InSource:
+		switch (a->mSelector) {
+		case kAudioObjectPropertyBaseClass:
+		case kAudioObjectPropertyClass:
+		case kAudioObjectPropertyOwner:
+		case kAudioControlPropertyScope:
+		case kAudioControlPropertyElement:
+		case kAudioSelectorControlPropertyCurrentItem:
+		case kAudioSelectorControlPropertyAvailableItems:
+		case kAudioSelectorControlPropertyItemKind:
+			*out = sizeof(UInt32); return 0;
+		case kAudioObjectPropertyOwnedObjects:
+			*out = 0; return 0;
+		case kAudioObjectPropertyName:
+		case kAudioSelectorControlPropertyItemName:
+			*out = sizeof(CFStringRef); return 0;
 		}
 		break;
 	case kObjectID_Stream:
@@ -571,13 +592,20 @@ A5_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 		case kAudioDevicePropertyStreams:
 			if (a->mScope == kAudioObjectPropertyScopeInput) {
 				u[0] = kObjectID_StreamIn;
+				if (a->mSelector == kAudioObjectPropertyOwnedObjects) {
+					u[1] = kObjectID_InSource;
+				}
 			} else {
 				u[0] = kObjectID_Stream;
 				if (a->mScope == kAudioObjectPropertyScopeGlobal) {
 					u[1] = kObjectID_StreamIn;
+					if (a->mSelector == kAudioObjectPropertyOwnedObjects) {
+						u[2] = kObjectID_InSource;
+					}
 				}
 			}
 			return 0;
+		case kAudioObjectPropertyControlList: *u = kObjectID_InSource; return 0;
 		case kAudioDevicePropertyRelatedDevices: *u = kObjectID_Device; return 0;
 		case kAudioDevicePropertyTransportType: *u = kAudioDeviceTransportTypeBuiltIn; return 0;
 		case kAudioDevicePropertyClockDomain: *u = 0; return 0;
@@ -638,6 +666,20 @@ A5_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 			return 0;
 		}
 		break;
+	case kObjectID_InSource:
+		switch (a->mSelector) {
+		case kAudioObjectPropertyBaseClass: *u = kAudioSelectorControlClassID; return 0;
+		case kAudioObjectPropertyClass: *u = kAudioDataSourceControlClassID; return 0;
+		case kAudioObjectPropertyOwner: *u = kObjectID_Device; return 0;
+		case kAudioControlPropertyScope: *u = kAudioObjectPropertyScopeInput; return 0;
+		case kAudioControlPropertyElement: *u = 0; return 0;
+		case kAudioSelectorControlPropertyCurrentItem: *u = gInSource; return 0;
+		case kAudioSelectorControlPropertyAvailableItems: *u = 'imic'; return 0;
+		case kAudioSelectorControlPropertyItemKind: *u = 0; return 0;
+		case kAudioObjectPropertyName: *(CFStringRef *)d = CFSTR("Input Source"); return 0;
+		case kAudioSelectorControlPropertyItemName: *(CFStringRef *)d = CFSTR("Microphone"); return 0;
+		}
+		break;
 	case kObjectID_Stream:
 	case kObjectID_StreamIn:
 		switch (a->mSelector) {
@@ -676,6 +718,11 @@ A5_SetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 	(void)pid; (void)qs; (void)q;
 	if (inDriver != gDriverRef) {
 		return kAudioHardwareBadObjectError;
+	}
+	if (o == kObjectID_InSource && a->mSelector == kAudioSelectorControlPropertyCurrentItem) {
+		NEED(sizeof(UInt32));
+		trace_prop("set-ok", o, a, 0);
+		return *(const UInt32 *)d == 'imic' ? 0 : kAudioHardwareIllegalOperationError;
 	}
 	if (o == kObjectID_Device && a->mSelector == kAudioDevicePropertyDataSource) {
 		NEED(sizeof(UInt32));
