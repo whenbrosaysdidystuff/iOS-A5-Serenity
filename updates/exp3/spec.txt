@@ -1,0 +1,8 @@
+# Experiment 3: where is VirtualAudio, and what crashed. Listings only (plus the usual logs).
+LIST    /Library/Audio/Plug-Ins/HAL
+LIST    /Library/Audio/Plug-Ins/HAL.disabled
+LIST    /System/Library/Audio/Plug-Ins/HAL
+LIST    /private/var/mobile/Library/Logs/CrashReporter
+LIST    /private/var/db
+COLLECT /private/var/mobile/Library/Logs/a5 2048
+COLLECT /private/var/db/a5audio.conf
