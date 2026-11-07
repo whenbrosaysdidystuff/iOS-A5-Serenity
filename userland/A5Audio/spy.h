@@ -304,6 +304,78 @@ static OSStatus spy_translate(AudioObjectID d, const void *i, void *o) { return 
 static OSStatus spy_unlisten(AudioObjectID o, const AudioObjectPropertyAddress *a, void *l, void *c)
 { return real_unlisten(rdp(o, a), a, l, c); }
 
+/* VirtualAudio's own driver interface: the HAL calls its SetPropertyData for every change that
+ * clients (MediaExperience: volume buttons, slider) make to VirtualAudio's objects (the VADs and
+ * their controls). Wrapping that entry shows how a volume change arrives, and lets the A5 output
+ * follow it: VirtualAudio routes to its null port, whose volume never reaches a physical device.
+ * Offsets are for the iOS 16 VirtualAudio this port uses; checked against two known entries. */
+#define VA_VTABLE       0x6343a0u       /* static AudioServerPlugInDriverInterface in __DATA */
+#define VA_QUERYIF      0x31b3c4u       /* entry 1, QueryInterface */
+#define VA_SETDATA      0x31d22cu       /* entry 15, SetPropertyData */
+typedef OSStatus (*DrvSetFn)(void *, AudioObjectID, pid_t, const AudioObjectPropertyAddress *, UInt32, const void *,
+    UInt32, const void *);
+typedef OSStatus (*DrvGetFn)(void *, AudioObjectID, pid_t, const AudioObjectPropertyAddress *, UInt32, const void *,
+    UInt32, UInt32 *, void *);
+static DrvSetFn va_real_set;
+static DrvGetFn va_real_get;
+static int gVAVol = 1;                  /* a5audio.conf vavol=0: log only */
+static UInt32 gVASetLines;
+
+static OSStatus
+va_set(void *drv, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 sz,
+    const void *d)
+{
+	OSStatus r = va_real_set(drv, o, pid, a, qs, q, sz, d);
+	char s1[5], s2[5];
+	UInt32 cls = 0, csz = sizeof(cls);
+	AudioObjectPropertyAddress ca = { kAudioObjectPropertyClass, kAudioObjectPropertyScopeGlobal, 0 };
+	(void)va_real_get(drv, o, 0, &ca, 0, NULL, csz, &csz, &cls);
+	Float32 f = 0;
+	if (sz == 4) {
+		memcpy(&f, d, 4);
+	}
+	int vol = a->mSelector == kAudioLevelControlPropertyScalarValue || a->mSelector == kAudioLevelControlPropertyDecibelValue ||
+	    a->mSelector == 'volm' || a->mSelector == 'vold' || a->mSelector == 'vcsv' || a->mSelector == 'vcdv';
+	if (gVASetLines++ < 3000 || vol) {
+		char c[5];
+		trace("va-set pid %d obj %u class '%s' '%s' '%s' el %u size %u val %d/1000 (%08x) -> %d\n", pid, o, fcc(cls, c),
+		    fcc(a->mSelector, s1), fcc(a->mScope, s2), a->mElement, sz, (int)(f * 1000), sz == 4 ? *(const UInt32 *)d : 0,
+		    (int)r);
+	}
+	if (r == 0 && gVAVol && cls == kAudioVolumeControlClassID && a->mSelector == kAudioLevelControlPropertyDecibelValue) {
+		/* read the scalar the control settled on */
+		Float32 sc = 0;
+		UInt32 ssz = sizeof(sc);
+		AudioObjectPropertyAddress sa = { kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal, 0 };
+		if (va_real_get(drv, o, 0, &sa, 0, NULL, ssz, &ssz, &sc) == 0) {
+			vol_set(sc);
+			trace("va-vol: obj %u dB %d/1000 -> scalar %d/1000 gain %d/1000\n", o, (int)(f * 1000), (int)(sc * 1000),
+			    (int)(gVolume * 1000));
+		}
+	} else if (r == 0 && gVAVol && cls == kAudioVolumeControlClassID && a->mSelector == kAudioLevelControlPropertyScalarValue) {
+		vol_set(f);
+		trace("va-vol: obj %u scalar %d/1000 gain %d/1000\n", o, (int)(f * 1000), (int)(gVolume * 1000));
+	}
+	return r;
+}
+
+static void
+va_hook_driver(const struct mach_header *mh)
+{
+	uintptr_t base = (uintptr_t)mh;
+	void **vt = (void **)(base + VA_VTABLE);
+	if ((uintptr_t)vt[1] != base + VA_QUERYIF || (uintptr_t)vt[15] != base + VA_SETDATA) {
+		trace("spy: VirtualAudio driver table not where expected (%p %p), volume follow off\n", vt[1], vt[15]);
+		return;
+	}
+	va_real_get = (DrvGetFn)vt[14];
+	va_real_set = (DrvSetFn)vt[15];
+	size_t pg = (size_t)getpagesize();
+	mprotect((void *)((uintptr_t)&vt[15] & ~(pg - 1)), pg, PROT_READ | PROT_WRITE);
+	vt[15] = (void *)va_set;
+	trace("spy: VirtualAudio SetPropertyData hooked\n");
+}
+
 static void
 spy_patch_image(const struct mach_header *mh, intptr_t slide)
 {
@@ -340,6 +412,7 @@ spy_patch_image(const struct mach_header *mh, intptr_t slide)
 			}
 		}
 	}
+	va_hook_driver(mh);
 	char msg[300];
 	int n = snprintf(msg, sizeof(msg), "spy: %s patched %u pointers\n", info.dli_fname, patched);
 	if (n > 0) {

@@ -273,6 +273,8 @@ read_conf(void)
 					gRinger = eq[1] != '0';
 				} else if (!strcmp(l, "spy")) {
 					gSpy = eq[1] == '1';
+				} else if (!strcmp(l, "vavol")) {
+					gVAVol = eq[1] != '0';
 				} else if (!strcmp(l, "vol")) {
 					gVolCtl = eq[1] != '0';
 				} else if (!strcmp(l, "custom")) {
