@@ -1,0 +1,11 @@
+# Experiment 18: exp17 worked at the HAL level - VirtualAudio's aggregate was built on the A5 device and
+# started IO into it - but VirtualAudio keeps the speaker mute control on (it routes to "Null"), so only
+# silence was written. A5Audio now ignores that mute (honormute=0), accepts the stream 'sact' set, and
+# hands samples to a writer thread through a ring (the HAL IO thread can no longer block on the kernel).
+FILE    ../../userland/A5Audio/out/A5Audio.driver/A5Audio /System/Library/Audio/Plug-Ins/HAL/A5Audio.driver/A5Audio 0755 0 0
+REMOVE  /private/var/mobile/Library/Logs/a5/a5audio.log
+REMOVE  /private/var/mobile/Library/Logs/a5/vaspy.log
+KILL    mediaserverd
+COLLECT /private/var/mobile/Library/Logs/a5 4096
+COLLECT /private/var/db/diagnostics/timesync 2048
+COLLECT /private/var/db/diagnostics/Persist 12288

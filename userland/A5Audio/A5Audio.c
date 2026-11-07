@@ -166,6 +166,7 @@ static int gBeep = 1;
 static int gSpy;
 static int gRinger = 1;
 static int gRedirectConf;
+static int gHonorMute;
 
 /* The Redmi has no ring/silent switch, and iOS treats a missing one as "silent": VirtualAudio culls
  * every system-sound route to the speaker ("ringer switch is off"). Publish the ringer as on
@@ -213,6 +214,8 @@ read_conf(void)
 					strlcpy(dst, eq + 1, 128);
 				} else if (!strcmp(l, "beep")) {
 					gBeep = eq[1] != '0';
+				} else if (!strcmp(l, "honormute")) {
+					gHonorMute = eq[1] == '1';
 				} else if (!strcmp(l, "redirect")) {
 					gRedirectConf = eq[1] == '1';
 				} else if (!strcmp(l, "ringer")) {
@@ -247,6 +250,52 @@ close_dev(void)
 		close(gFd);
 		gFd = -1;
 	}
+}
+
+/* user-space ring between the HAL IO thread and the kernel device */
+#define RING_U_FRAMES   32768u
+static int16_t gRing[RING_U_FRAMES * kChannels];
+static _Atomic UInt32 gRingWr, gRingRd;
+static UInt32 gDropped;
+
+static pthread_t gWriter;
+
+static void *
+writer_thread(void *arg)
+{
+	unsigned idle = 0;
+	(void)arg;
+	for (;;) {
+		UInt32 rd = atomic_load_explicit(&gRingRd, memory_order_relaxed);
+		UInt32 wr = atomic_load_explicit(&gRingWr, memory_order_acquire);
+		if (wr == rd) {
+			/* release the device after 1 s of silence (it is single-open: beeps need it too) */
+			if (++idle > 500 && gFd >= 0) {
+				close_dev();
+			}
+			usleep(2000);
+			continue;
+		}
+		idle = 0;
+		open_dev();
+		if (gFd < 0) {
+			atomic_store_explicit(&gRingRd, wr, memory_order_release);     /* nowhere to play */
+			usleep(100000);
+			continue;
+		}
+		UInt32 n = wr - rd, off = rd % RING_U_FRAMES;
+		if (n > RING_U_FRAMES - off) {
+			n = RING_U_FRAMES - off;
+		}
+		ssize_t w = write(gFd, &gRing[off * kChannels], n * kChannels * sizeof(int16_t));
+		if (w > 0) {
+			atomic_store_explicit(&gRingRd, rd + (UInt32)w / (kChannels * sizeof(int16_t)), memory_order_release);
+		} else {
+			close_dev();
+			usleep(10000);
+		}
+	}
+	return NULL;
 }
 
 /* 200 ms 660 Hz beep with a linear fade, written directly to the kernel device */
@@ -403,6 +452,9 @@ A5_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHo
 		gRedirect = gRedirectConf;
 		spy_install();
 	}
+	if (pthread_create(&gWriter, NULL, writer_thread, NULL) == 0) {
+		pthread_detach(gWriter);
+	}
 	if (gRinger) {
 		pthread_t rt;
 		if (pthread_create(&rt, NULL, ringer_thread, NULL) == 0) {
@@ -458,7 +510,8 @@ A5_IsPropertySettable(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjec
 	*out = (inObjectID == kObjectID_Device && (a->mSelector == kAudioDevicePropertyNominalSampleRate ||
 	    a->mSelector == kAudioDevicePropertyDataSource || extra_index(a->mSelector) >= 0)) ||
 	    (inObjectID == kObjectID_InSource && a->mSelector == kAudioSelectorControlPropertyCurrentItem) ||
-	    (inObjectID == kObjectID_SpkMute && a->mSelector == kAudioBooleanControlPropertyValue);
+	    (inObjectID == kObjectID_SpkMute && a->mSelector == kAudioBooleanControlPropertyValue) ||
+	    ((inObjectID == kObjectID_Stream || inObjectID == kObjectID_StreamIn) && a->mSelector == kAudioStreamPropertyIsActive);
 	return 0;
 }
 
@@ -799,6 +852,10 @@ A5_SetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 	if (inDriver != gDriverRef) {
 		return kAudioHardwareBadObjectError;
 	}
+	if ((o == kObjectID_Stream || o == kObjectID_StreamIn) && a->mSelector == kAudioStreamPropertyIsActive) {
+		NEED(sizeof(UInt32));
+		return 0;
+	}
 	if (o == kObjectID_SpkMute && a->mSelector == kAudioBooleanControlPropertyValue) {
 		NEED(sizeof(UInt32));
 		gSpkMuted = *(const UInt32 *)d != 0;
@@ -850,7 +907,6 @@ A5_StartIO(AudioServerPlugInDriverRef inDriver, AudioObjectID o, UInt32 client)
 	}
 	trace("StartIO client %u (io count %u)\n", client, gIOCount);
 	if (gIOCount++ == 0) {
-		open_dev();
 		gNumberTimeStamps = 0;
 		gAnchorHostTime = mach_absolute_time();
 	}
@@ -865,8 +921,8 @@ A5_StopIO(AudioServerPlugInDriverRef inDriver, AudioObjectID o, UInt32 client)
 		return kAudioHardwareBadObjectError;
 	}
 	trace("StopIO client %u\n", client);
-	if (gIOCount > 0 && --gIOCount == 0) {
-		close_dev();
+	if (gIOCount > 0) {
+		gIOCount--;
 	}
 	return 0;
 }
@@ -919,13 +975,14 @@ A5_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID o, AudioObje
 		return kAudioHardwareBadObjectError;
 	}
 	static UInt32 writes;
-	if (op == kAudioServerPlugInIOOperationWriteMix && (writes++ % 2000) == 0) {
+	if (op == kAudioServerPlugInIOOperationWriteMix && (writes++ < 3 || (writes % 500) == 0)) {
 		Float32 peak = 0;
 		for (UInt32 k = 0; main && k < frames * kChannels; k++) {
 			Float32 v = ((const Float32 *)main)[k];
 			peak = v > peak ? v : -v > peak ? -v : peak;
 		}
-		trace("WriteMix #%u: %u frames, peak %d/1000, fd %d, muted %u\n", writes, frames, (int)(peak * 1000), gFd, gSpkMuted);
+		trace("WriteMix #%u: %u frames, peak %d/1000, fd %d, muted %u, dropped %u\n", writes, frames, (int)(peak * 1000), gFd,
+		    gSpkMuted, gDropped);
 	}
 	if (op == kAudioServerPlugInIOOperationReadInput && main) {
 		memset(main, 0, (size_t)frames * kChannels * sizeof(Float32));         /* no microphone yet */
@@ -934,28 +991,24 @@ A5_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID o, AudioObje
 	if (op != kAudioServerPlugInIOOperationWriteMix || !main) {
 		return 0;
 	}
-	if (gFd < 0) {
-		open_dev();
-		if (gFd < 0) {
-			return 0;
-		}
-	}
-	static int16_t out[8192 * kChannels];
+	/* the IO thread never blocks: samples go to a ring that a writer thread drains into the kernel */
 	const Float32 *in = main;
-	UInt32 done = 0;
-	while (done < frames) {
-		UInt32 n = frames - done;
-		if (n > 8192) {
-			n = 8192;
+	int mute = gSpkMuted && gHonorMute;
+	UInt32 wr = atomic_load_explicit(&gRingWr, memory_order_relaxed);
+	UInt32 rdp_ = atomic_load_explicit(&gRingRd, memory_order_acquire);
+	for (UInt32 f = 0; f < frames; f++) {
+		if (wr - rdp_ >= RING_U_FRAMES) {
+			gDropped += frames - f;
+			break;
 		}
-		for (UInt32 k = 0; k < n * kChannels; k++) {
-			Float32 v = gSpkMuted ? 0.0f : in[done * kChannels + k] * gVolume;
+		for (UInt32 c = 0; c < kChannels; c++) {
+			Float32 v = mute ? 0.0f : in[f * kChannels + c] * gVolume;
 			v = v > 1.0f ? 1.0f : v < -1.0f ? -1.0f : v;
-			out[k] = (int16_t)(v * 32767.0f);
+			gRing[(wr % RING_U_FRAMES) * kChannels + c] = (int16_t)(v * 32767.0f);
 		}
-		(void)write(gFd, out, n * kChannels * sizeof(int16_t));
-		done += n;
+		wr++;
 	}
+	atomic_store_explicit(&gRingWr, wr, memory_order_release);
 	return 0;
 }
 
