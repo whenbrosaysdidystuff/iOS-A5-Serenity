@@ -1,0 +1,7 @@
+# Experiment 6: VirtualAudio rejected the Codec with "The HAL returned input stream size of 0".
+# A5Audio now also has a (silent) input stream; the hello beep waits for the kernel driver.
+FILE    ../../userland/A5Audio/out/A5Audio.driver/A5Audio /System/Library/Audio/Plug-Ins/HAL/A5Audio.driver/A5Audio 0755 0 0
+KILL    mediaserverd
+COLLECT /private/var/mobile/Library/Logs/a5 2048
+COLLECT /private/var/db/diagnostics/timesync 2048
+COLLECT /private/var/db/diagnostics/Persist 12288

@@ -23,10 +23,12 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <os/lock.h>
+#include <pthread.h>
 
 #define kObjectID_PlugIn        kAudioObjectPlugInObject
 #define kObjectID_Device        2
 #define kObjectID_Stream        3
+#define kObjectID_StreamIn      4       /* silent input: VirtualAudio requires the Codec to have one */
 
 #define kDevice_UID             "A5AudioSpeaker_UID"
 #define kDevice_ModelUID        "A5AudioSpeaker_ModelUID"
@@ -155,14 +157,20 @@ close_dev(void)
 }
 
 /* 200 ms 660 Hz beep with a linear fade, written directly to the kernel device */
-static void
+static void *
 hello_beep(void)
 {
 	static const int16_t sine16[16] = { 0, 3062, 5657, 7391, 8000, 7391, 5657, 3062,
 		0, -3062, -5657, -7391, -8000, -7391, -5657, -3062 };
-	int fd = open("/dev/a5audio", O_WRONLY);
+	int fd = -1;
+	for (int t = 0; t < 60 && fd < 0; t++) {        /* the kernel driver may still be starting */
+		fd = open("/dev/a5audio", O_WRONLY);
+		if (fd < 0) {
+			usleep(250000);
+		}
+	}
 	if (fd < 0) {
-		return;
+		return NULL;
 	}
 	enum { N = 48000 / 5 };
 	static int16_t buf[N * 2];
@@ -174,6 +182,7 @@ hello_beep(void)
 	}
 	(void)write(fd, buf, sizeof(buf));
 	close(fd);
+	return NULL;
 }
 
 static void
@@ -299,7 +308,10 @@ A5_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHo
 	read_conf();
 	trace("--- A5Audio Initialize (pid %d)\n", getpid());
 	if (gBeep) {
-		hello_beep();
+		pthread_t th;
+		if (pthread_create(&th, NULL, (void *(*)(void *))hello_beep, NULL) == 0) {
+			pthread_detach(th);
+		}
 	}
 	return 0;
 }
@@ -398,7 +410,7 @@ A5_GetPropertyDataSize_(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pi
 			*out = sizeof(CFStringRef); return 0;
 		case kAudioObjectPropertyOwnedObjects:
 		case kAudioDevicePropertyStreams:
-			*out = (a->mScope == kAudioObjectPropertyScopeInput) ? 0 : sizeof(AudioObjectID); return 0;
+			*out = (a->mScope == kAudioObjectPropertyScopeGlobal ? 2 : 1) * sizeof(AudioObjectID); return 0;
 		case kAudioObjectPropertyControlList:
 		case kAudioDevicePropertyRelatedDevices:
 			*out = (a->mSelector == kAudioDevicePropertyRelatedDevices) ? sizeof(AudioObjectID) : 0; return 0;
@@ -424,6 +436,7 @@ A5_GetPropertyDataSize_(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pi
 		}
 		break;
 	case kObjectID_Stream:
+	case kObjectID_StreamIn:
 		switch (a->mSelector) {
 		case kAudioObjectPropertyBaseClass:
 		case kAudioObjectPropertyClass:
@@ -492,7 +505,16 @@ A5_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 		case kAudioDevicePropertyDeviceUID: *(CFStringRef *)d = CFRetain(gUID); return 0;
 		case kAudioDevicePropertyModelUID: *(CFStringRef *)d = CFRetain(gModel); return 0;
 		case kAudioObjectPropertyOwnedObjects:
-		case kAudioDevicePropertyStreams: *u = kObjectID_Stream; return 0;
+		case kAudioDevicePropertyStreams:
+			if (a->mScope == kAudioObjectPropertyScopeInput) {
+				u[0] = kObjectID_StreamIn;
+			} else {
+				u[0] = kObjectID_Stream;
+				if (a->mScope == kAudioObjectPropertyScopeGlobal) {
+					u[1] = kObjectID_StreamIn;
+				}
+			}
+			return 0;
 		case kAudioDevicePropertyRelatedDevices: *u = kObjectID_Device; return 0;
 		case kAudioDevicePropertyTransportType: *u = kAudioDeviceTransportTypeBuiltIn; return 0;
 		case kAudioDevicePropertyClockDomain: *u = 0; return 0;
@@ -523,13 +545,16 @@ A5_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 		}
 		break;
 	case kObjectID_Stream:
+	case kObjectID_StreamIn:
 		switch (a->mSelector) {
 		case kAudioObjectPropertyBaseClass: *u = kAudioObjectClassID; return 0;
 		case kAudioObjectPropertyClass: *u = kAudioStreamClassID; return 0;
 		case kAudioObjectPropertyOwner: *u = kObjectID_Device; return 0;
 		case kAudioStreamPropertyIsActive: *u = 1; return 0;
-		case kAudioStreamPropertyDirection: *u = 0; return 0;                   /* output */
-		case kAudioStreamPropertyTerminalType: *u = kAudioStreamTerminalTypeSpeaker; return 0;
+		case kAudioStreamPropertyDirection: *u = (o == kObjectID_StreamIn); return 0;   /* 0 out, 1 in */
+		case kAudioStreamPropertyTerminalType:
+			*u = o == kObjectID_StreamIn ? kAudioStreamTerminalTypeMicrophone : kAudioStreamTerminalTypeSpeaker;
+			return 0;
 		case kAudioStreamPropertyStartingChannel: *u = 1; return 0;
 		case kAudioStreamPropertyLatency: *u = 0; return 0;
 		case kAudioStreamPropertyVirtualFormat:
@@ -561,7 +586,7 @@ A5_SetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 		NEED(sizeof(Float64));
 		return *(const Float64 *)d == kSampleRate ? 0 : kAudioHardwareIllegalOperationError;
 	}
-	if (o == kObjectID_Stream && (a->mSelector == kAudioStreamPropertyVirtualFormat ||
+	if ((o == kObjectID_Stream || o == kObjectID_StreamIn) && (a->mSelector == kAudioStreamPropertyVirtualFormat ||
 	    a->mSelector == kAudioStreamPropertyPhysicalFormat)) {
 		NEED(sizeof(AudioStreamBasicDescription));
 		const AudioStreamBasicDescription *f = d;
@@ -629,7 +654,7 @@ A5_WillDoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID o, UInt3
 	if (inDriver != gDriverRef || o != kObjectID_Device) {
 		return kAudioHardwareBadObjectError;
 	}
-	*will = (op == kAudioServerPlugInIOOperationWriteMix);
+	*will = (op == kAudioServerPlugInIOOperationWriteMix || op == kAudioServerPlugInIOOperationReadInput);
 	*inPlace = true;
 	return 0;
 }
@@ -648,6 +673,10 @@ A5_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID o, AudioObje
 	(void)client; (void)cycle; (void)secondary; (void)stream;
 	if (inDriver != gDriverRef || o != kObjectID_Device) {
 		return kAudioHardwareBadObjectError;
+	}
+	if (op == kAudioServerPlugInIOOperationReadInput && main) {
+		memset(main, 0, (size_t)frames * kChannels * sizeof(Float32));         /* no microphone yet */
+		return 0;
 	}
 	if (op != kAudioServerPlugInIOOperationWriteMix || !main) {
 		return 0;
