@@ -1,0 +1,9 @@
+# Experiment 20: exp19 still high-pitched: VirtualAudio renders for its Null_Device's 44.1 kHz and never
+# asks A5Audio to switch. A5Audio now starts at 44.1 kHz (rate=44100) so the whole aggregate runs at
+# 44.1 kHz; the writer thread resamples to the kernel's 48 kHz.
+FILE    ../../userland/A5Audio/out/A5Audio.driver/A5Audio /System/Library/Audio/Plug-Ins/HAL/A5Audio.driver/A5Audio 0755 0 0
+FILE    a5audio.conf /private/var/db/a5audio.conf 0644 0 0
+REMOVE  /private/var/mobile/Library/Logs/a5/a5audio.log
+REMOVE  /private/var/mobile/Library/Logs/a5/vaspy.log
+KILL    mediaserverd
+COLLECT /private/var/mobile/Library/Logs/a5 4096

@@ -216,6 +216,8 @@ read_conf(void)
 					strlcpy(dst, eq + 1, 128);
 				} else if (!strcmp(l, "beep")) {
 					gBeep = eq[1] != '0';
+				} else if (!strcmp(l, "rate")) {
+					gRate = gPendingRate = (eq[1] == '4') ? 44100.0 : 48000.0;
 				} else if (!strcmp(l, "honormute")) {
 					gHonorMute = eq[1] == '1';
 				} else if (!strcmp(l, "redirect")) {
@@ -482,8 +484,9 @@ A5_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHo
 	mach_timebase_info_data_t tb;
 	mach_timebase_info(&tb);
 	gHostHz = 1e9 * (Float64)tb.denom / (Float64)tb.numer;
-	gHostTicksPerFrame = gHostHz / gRate;
 	read_conf();
+	gHostTicksPerFrame = gHostHz / gRate;
+	trace("rate %d\n", (int)gRate);
 	if (gSpy || gRedirectConf) {
 		gRedirect = gRedirectConf;
 		spy_install();
