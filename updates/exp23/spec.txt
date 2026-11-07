@@ -1,0 +1,8 @@
+# Experiment 23: exp22 measured the A5 path exactly right (HAL 43.9k/s in, 47.8k/s out = 48/44.1) and
+# both reference tones matched, so the remaining "too high" is content: VirtualAudio renders at 48 kHz
+# into the 44.1 kHz stream. Run A5Audio at 48 kHz again (rate=48000) now that the format bug is fixed.
+FILE    a5audio.conf /private/var/db/a5audio.conf 0644 0 0
+REMOVE  /private/var/mobile/Library/Logs/a5/a5audio.log
+REMOVE  /private/var/mobile/Library/Logs/a5/vaspy.log
+KILL    mediaserverd
+COLLECT /private/var/mobile/Library/Logs/a5 4096
