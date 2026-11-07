@@ -1,0 +1,9 @@
+# Experiment 8: the Codec was still dropped with 'who?'. The failures that reach A5Audio are 'taps'
+# on the input stream (an iOS HAL stream property, UInt32) - now answered with 0. The private
+# Codec properties are also declared as custom properties (the HAL never forwarded them).
+FILE    ../../userland/A5Audio/out/A5Audio.driver/A5Audio /System/Library/Audio/Plug-Ins/HAL/A5Audio.driver/A5Audio 0755 0 0
+REMOVE  /private/var/mobile/Library/Logs/a5/a5audio.log
+KILL    mediaserverd
+COLLECT /private/var/mobile/Library/Logs/a5 2048
+COLLECT /private/var/db/diagnostics/timesync 2048
+COLLECT /private/var/db/diagnostics/Persist 12288

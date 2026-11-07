@@ -5,6 +5,6 @@ install-name: '/System/Library/Frameworks/CoreFoundation.framework/CoreFoundatio
 current-version: 1953
 exports:
   - targets: [ arm64-ios ]
-    symbols: [ _CFEqual, _CFRelease, _CFRetain, _CFStringCreateWithCString, _CFStringGetCString, _CFUUIDCreateFromUUIDBytes, _CFUUIDGetConstantUUIDWithBytes,
+    symbols: [ _CFEqual, _CFRelease, _CFRetain, _CFStringCreateWithCString, _CFStringGetCString, _CFNumberCreate, _CFNumberGetValue, _CFGetTypeID, _CFNumberGetTypeID, _CFUUIDCreateFromUUIDBytes, _CFUUIDGetConstantUUIDWithBytes,
                ___CFConstantStringClassReference, _kCFAllocatorSystemDefault ]
 ...

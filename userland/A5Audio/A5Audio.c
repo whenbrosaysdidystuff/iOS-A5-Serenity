@@ -48,8 +48,10 @@ static UInt64 gNumberTimeStamps;
 static Float32 gVolume = 1.0f;          /* reserved for a volume control */
 static CFStringRef gUID, gName, gModel;
 
-/* iOS-private device properties VirtualAudio's Device_Codec_Aspen listens to (UInt32, any scope):
- * 'bb2w' 'w2bb' 'fm2r' (play-through scope) and 'iend' (input). Kept as plain settable values. */
+/* iOS-private device properties VirtualAudio's Device_Codec_Aspen listens to (any scope):
+ * 'bb2w' 'w2bb' 'fm2r' (play-through scope) and 'iend' (input). The HAL forwards non-standard
+ * selectors of a plug-in only when they are declared in kAudioObjectPropertyCustomPropertyInfoList,
+ * and then only as CF types, so they are published as CFNumbers (settable). */
 static const UInt32 kExtraSel[] = { 'bb2w', 'w2bb', 'fm2r', 'iend' };
 static UInt32 gExtraVal[4];
 
@@ -457,7 +459,11 @@ A5_GetPropertyDataSize_(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pi
 			*out = offsetof(AudioChannelLayout, mChannelDescriptions) + kChannels * sizeof(AudioChannelDescription); return 0;
 		}
 		if (extra_index(a->mSelector) >= 0) {
-			*out = sizeof(UInt32);
+			*out = sizeof(CFPropertyListRef);
+			return 0;
+		}
+		if (a->mSelector == kAudioObjectPropertyCustomPropertyInfoList) {
+			*out = 4 * sizeof(AudioServerPlugInCustomPropertyInfo);
 			return 0;
 		}
 		break;
@@ -476,6 +482,7 @@ A5_GetPropertyDataSize_(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pi
 		case kAudioStreamPropertyTerminalType:
 		case kAudioStreamPropertyStartingChannel:
 		case kAudioStreamPropertyLatency:
+		case 'taps':    /* iOS HAL stream property (UInt32) VirtualAudio reads on input streams; 0 */
 			*out = sizeof(UInt32); return 0;
 		case kAudioStreamPropertyVirtualFormat:
 		case kAudioStreamPropertyPhysicalFormat:
@@ -570,7 +577,17 @@ A5_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 		}
 		}
 		if (extra_index(a->mSelector) >= 0) {
-			*u = gExtraVal[extra_index(a->mSelector)];
+			SInt32 v = (SInt32)gExtraVal[extra_index(a->mSelector)];
+			*(CFPropertyListRef *)d = CFNumberCreate(NULL, kCFNumberSInt32Type, &v);
+			return 0;
+		}
+		if (a->mSelector == kAudioObjectPropertyCustomPropertyInfoList) {
+			AudioServerPlugInCustomPropertyInfo *ci = d;
+			for (int i = 0; i < 4; i++) {
+				ci[i].mSelector = kExtraSel[i];
+				ci[i].mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFPropertyList;
+				ci[i].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
+			}
 			return 0;
 		}
 		break;
@@ -586,6 +603,7 @@ A5_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 			*u = o == kObjectID_StreamIn ? kAudioStreamTerminalTypeMicrophone : kAudioStreamTerminalTypeSpeaker;
 			return 0;
 		case kAudioStreamPropertyStartingChannel: *u = 1; return 0;
+		case 'taps': *u = 0; return 0;
 		case kAudioStreamPropertyLatency: *u = 0; return 0;
 		case kAudioStreamPropertyVirtualFormat:
 			fill_asbd(d, false); return 0;
@@ -613,8 +631,13 @@ A5_SetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 		return kAudioHardwareBadObjectError;
 	}
 	if (o == kObjectID_Device && extra_index(a->mSelector) >= 0) {
-		NEED(sizeof(UInt32));
-		gExtraVal[extra_index(a->mSelector)] = *(const UInt32 *)d;
+		NEED(sizeof(CFPropertyListRef));
+		CFPropertyListRef pl = *(const CFPropertyListRef *)d;
+		SInt32 v = 0;
+		if (pl && CFGetTypeID(pl) == CFNumberGetTypeID()) {
+			CFNumberGetValue((CFNumberRef)pl, kCFNumberSInt32Type, &v);
+		}
+		gExtraVal[extra_index(a->mSelector)] = (UInt32)v;
 		trace_prop("set-ok", o, a, 0);
 		return 0;
 	}
