@@ -48,6 +48,22 @@ static UInt64 gNumberTimeStamps;
 static Float32 gVolume = 1.0f;          /* reserved for a volume control */
 static CFStringRef gUID, gName, gModel;
 
+/* iOS-private device properties VirtualAudio's Device_Codec_Aspen listens to (UInt32, any scope):
+ * 'bb2w' 'w2bb' 'fm2r' (play-through scope) and 'iend' (input). Kept as plain settable values. */
+static const UInt32 kExtraSel[] = { 'bb2w', 'w2bb', 'fm2r', 'iend' };
+static UInt32 gExtraVal[4];
+
+static int
+extra_index(UInt32 sel)
+{
+	for (int i = 0; i < 4; i++) {
+		if (kExtraSel[i] == sel) {
+			return i;
+		}
+	}
+	return -1;
+}
+
 /* trace of what the HAL / VirtualAudio asks this driver, each distinct request once:
  * /private/var/mobile/Library/Logs/a5/a5audio.log (collected by a5update) */
 static os_unfair_lock gTraceLock = OS_UNFAIR_LOCK_INIT;
@@ -89,12 +105,18 @@ fcc(UInt32 v, char *b)
 static void
 trace_prop(const char *what, AudioObjectID o, const AudioObjectPropertyAddress *a, OSStatus st)
 {
+	static UInt32 errors;
 	UInt64 key = ((UInt64)a->mSelector << 32) ^ ((UInt64)a->mScope << 8) ^ ((UInt64)o << 3) ^ (UInt64)(what[0] + (st ? 1 : 0));
 	os_unfair_lock_lock(&gTraceLock);
-	for (UInt32 i = 0; i < gSeenN; i++) {
-		if (gSeen[i] == key) {
-			os_unfair_lock_unlock(&gTraceLock);
-			return;
+	/* failures are logged every time (up to 3000), so requests made after the HAL's own are seen */
+	if (st && errors < 3000) {
+		errors++;
+	} else {
+		for (UInt32 i = 0; i < gSeenN; i++) {
+			if (gSeen[i] == key) {
+				os_unfair_lock_unlock(&gTraceLock);
+				return;
+			}
 		}
 	}
 	if (gSeenN < 1024) {
@@ -434,6 +456,10 @@ A5_GetPropertyDataSize_(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pi
 		case kAudioDevicePropertyPreferredChannelLayout:
 			*out = offsetof(AudioChannelLayout, mChannelDescriptions) + kChannels * sizeof(AudioChannelDescription); return 0;
 		}
+		if (extra_index(a->mSelector) >= 0) {
+			*out = sizeof(UInt32);
+			return 0;
+		}
 		break;
 	case kObjectID_Stream:
 	case kObjectID_StreamIn:
@@ -543,6 +569,10 @@ A5_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 			return 0;
 		}
 		}
+		if (extra_index(a->mSelector) >= 0) {
+			*u = gExtraVal[extra_index(a->mSelector)];
+			return 0;
+		}
 		break;
 	case kObjectID_Stream:
 	case kObjectID_StreamIn:
@@ -581,6 +611,12 @@ A5_SetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 	(void)pid; (void)qs; (void)q;
 	if (inDriver != gDriverRef) {
 		return kAudioHardwareBadObjectError;
+	}
+	if (o == kObjectID_Device && extra_index(a->mSelector) >= 0) {
+		NEED(sizeof(UInt32));
+		gExtraVal[extra_index(a->mSelector)] = *(const UInt32 *)d;
+		trace_prop("set-ok", o, a, 0);
+		return 0;
 	}
 	if (o == kObjectID_Device && a->mSelector == kAudioDevicePropertyNominalSampleRate) {
 		NEED(sizeof(Float64));

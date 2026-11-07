@@ -1,0 +1,9 @@
+# Experiment 7: VirtualAudio dropped the Codec with CAException 'who?' right after creating its
+# streams: Device_Codec_Aspen listens to the private properties 'bb2w' 'w2bb' 'fm2r' (play-through)
+# and 'iend' (input). A5Audio now has them; failed requests are traced every time.
+FILE    ../../userland/A5Audio/out/A5Audio.driver/A5Audio /System/Library/Audio/Plug-Ins/HAL/A5Audio.driver/A5Audio 0755 0 0
+REMOVE  /private/var/mobile/Library/Logs/a5/a5audio.log
+KILL    mediaserverd
+COLLECT /private/var/mobile/Library/Logs/a5 2048
+COLLECT /private/var/db/diagnostics/timesync 2048
+COLLECT /private/var/db/diagnostics/Persist 12288
