@@ -168,6 +168,8 @@ static int gBeep = 1;
 static int gSpy;
 static int gRinger = 1;
 static int gRedirectConf;
+static int gPitchTest;
+static _Atomic UInt64 gOutFrames;
 static int gHonorMute;
 
 /* The Redmi has no ring/silent switch, and iOS treats a missing one as "silent": VirtualAudio culls
@@ -216,6 +218,8 @@ read_conf(void)
 					strlcpy(dst, eq + 1, 128);
 				} else if (!strcmp(l, "beep")) {
 					gBeep = eq[1] != '0';
+				} else if (!strcmp(l, "pitchtest")) {
+					gPitchTest = eq[1] == '1';
 				} else if (!strcmp(l, "rate")) {
 					gRate = gPendingRate = (eq[1] == '4') ? 44100.0 : 48000.0;
 				} else if (!strcmp(l, "honormute")) {
@@ -295,6 +299,9 @@ writer_thread(void *arg)
 			}
 			ssize_t w = write(gFd, &gRing[off * kChannels], n * kChannels * sizeof(int16_t));
 			if (w > 0) {
+				atomic_fetch_add(&gOutFrames, (UInt64)w / (kChannels * sizeof(int16_t)));
+			}
+			if (w > 0) {
 				atomic_store_explicit(&gRingRd, rd + (UInt32)w / (kChannels * sizeof(int16_t)), memory_order_release);
 			} else {
 				close_dev();
@@ -328,6 +335,7 @@ writer_thread(void *arg)
 			usleep(1000);
 			continue;
 		}
+		atomic_fetch_add(&gOutFrames, o);
 		if (write(gFd, out, o * kChannels * sizeof(int16_t)) <= 0) {
 			close_dev();
 			usleep(10000);
@@ -361,6 +369,31 @@ hello_beep(void)
 		buf[2 * i] = buf[2 * i + 1] = (int16_t)s;
 	}
 	(void)write(fd, buf, sizeof(buf));
+	if (gPitchTest) {
+		/* pitch reference: 1 s of 440 Hz straight to the kernel (48 kHz), 0.5 s gap, then 1 s of 440 Hz
+		 * generated at the HAL rate and sent through the ring + resampler. Both should sound the same. */
+		static int16_t t1[48000 * 2];
+		ph = 0;
+		step = (UInt32)(440u * 16u * 65536u / 48000u);
+		for (UInt32 i = 0; i < 48000; i++) {
+			t1[2 * i] = t1[2 * i + 1] = sine16[(ph >> 16) & 15];
+			ph += step;
+		}
+		(void)write(fd, t1, sizeof(t1));
+		close(fd);
+		usleep(1700000);
+		UInt32 n = (UInt32)gRate, wr = atomic_load(&gRingWr);
+		ph = 0;
+		step = (UInt32)(440.0 * 16.0 * 65536.0 / gRate);
+		for (UInt32 i = 0; i < n; i++) {
+			int16_t v = sine16[(ph >> 16) & 15];
+			ph += step;
+			gRing[((wr + i) % RING_U_FRAMES) * kChannels] = gRing[((wr + i) % RING_U_FRAMES) * kChannels + 1] = v;
+		}
+		atomic_store(&gRingWr, wr + n);
+		trace("pitch test queued: %u frames at %d Hz\n", n, (int)gRate);
+		return NULL;
+	}
 	close(fd);
 	return NULL;
 }
@@ -1049,6 +1082,24 @@ A5_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID o, AudioObje
 		return kAudioHardwareBadObjectError;
 	}
 	static UInt32 writes;
+	static UInt64 inFrames, t0, out0;
+	if (op == kAudioServerPlugInIOOperationWriteMix) {
+		UInt64 now = mach_absolute_time();
+		if (!t0) {
+			t0 = now;
+			out0 = atomic_load(&gOutFrames);
+		}
+		inFrames += frames;
+		if ((writes % 500) == 499) {
+			double sec = (double)(now - t0) / gHostHz;
+			trace("rates over %.1f s: HAL in %.0f/s, kernel out %.0f/s, ring %u, cycle sample %.0f\n", sec,
+			    inFrames / sec, (atomic_load(&gOutFrames) - out0) / sec,
+			    atomic_load(&gRingWr) - atomic_load(&gRingRd), cycle ? cycle->mOutputTime.mSampleTime : -1.0);
+			t0 = now;
+			inFrames = 0;
+			out0 = atomic_load(&gOutFrames);
+		}
+	}
 	if (op == kAudioServerPlugInIOOperationWriteMix && (writes++ < 3 || (writes % 500) == 0)) {
 		Float32 peak = 0;
 		for (UInt32 k = 0; main && k < frames * kChannels; k++) {

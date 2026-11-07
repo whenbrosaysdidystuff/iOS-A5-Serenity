@@ -1,0 +1,10 @@
+# Experiment 22: much better, still too high + crackling. Measure it: A5Audio logs the real HAL input
+# rate, the rate it feeds the kernel and its ring fill every ~10 s of IO; after the hello beep it
+# plays a pitch reference: 1 s 440 Hz straight to the kernel, then 1 s 440 Hz through its ring and
+# 44.1->48 kHz resampler (both should sound identical).
+FILE    ../../userland/A5Audio/out/A5Audio.driver/A5Audio /System/Library/Audio/Plug-Ins/HAL/A5Audio.driver/A5Audio 0755 0 0
+FILE    a5audio.conf /private/var/db/a5audio.conf 0644 0 0
+REMOVE  /private/var/mobile/Library/Logs/a5/a5audio.log
+REMOVE  /private/var/mobile/Library/Logs/a5/vaspy.log
+KILL    mediaserverd
+COLLECT /private/var/mobile/Library/Logs/a5 4096
