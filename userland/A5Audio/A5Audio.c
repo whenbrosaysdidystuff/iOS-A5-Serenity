@@ -165,6 +165,7 @@ trace_prop(const char *what, AudioObjectID o, const AudioObjectPropertyAddress *
 static int gBeep = 1;
 static int gSpy;
 static int gRinger = 1;
+static int gRedirectConf;
 
 /* The Redmi has no ring/silent switch, and iOS treats a missing one as "silent": VirtualAudio culls
  * every system-sound route to the speaker ("ringer switch is off"). Publish the ringer as on
@@ -212,6 +213,8 @@ read_conf(void)
 					strlcpy(dst, eq + 1, 128);
 				} else if (!strcmp(l, "beep")) {
 					gBeep = eq[1] != '0';
+				} else if (!strcmp(l, "redirect")) {
+					gRedirectConf = eq[1] == '1';
 				} else if (!strcmp(l, "ringer")) {
 					gRinger = eq[1] != '0';
 				} else if (!strcmp(l, "spy")) {
@@ -396,7 +399,8 @@ A5_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHo
 	Float64 hostHz = 1e9 * (Float64)tb.denom / (Float64)tb.numer;
 	gHostTicksPerFrame = hostHz / kSampleRate;
 	read_conf();
-	if (gSpy) {
+	if (gSpy || gRedirectConf) {
+		gRedirect = gRedirectConf;
 		spy_install();
 	}
 	if (gRinger) {

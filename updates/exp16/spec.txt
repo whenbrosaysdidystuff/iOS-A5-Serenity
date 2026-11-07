@@ -1,0 +1,12 @@
+# Experiment 16: VirtualAudio still sends every route to its own Null_Device. A5Audio's spy now
+# redirects VirtualAudio's IO calls (AudioDeviceCreateIOProcID/Start/Stop/..., and the IO/format
+# properties) for Null_Device and its streams to the A5 Codec device, so the default route plays
+# through the speaker. UID back to Codec.
+FILE    ../../userland/A5Audio/out/A5Audio.driver/A5Audio /System/Library/Audio/Plug-Ins/HAL/A5Audio.driver/A5Audio 0755 0 0
+FILE    a5audio.conf /private/var/db/a5audio.conf 0644 0 0
+REMOVE  /private/var/mobile/Library/Logs/a5/a5audio.log
+REMOVE  /private/var/mobile/Library/Logs/a5/vaspy.log
+KILL    mediaserverd
+COLLECT /private/var/mobile/Library/Logs/a5 4096
+COLLECT /private/var/db/diagnostics/timesync 2048
+COLLECT /private/var/db/diagnostics/Persist 12288
