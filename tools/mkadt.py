@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--a5 [--touch-fw FT8057.bin]]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--a5 [--touch-fw FT8057.bin] [--amp-fw frsm-spk1.bin]]
 
 --a5: Redmi A5 (serenity, Unisoc UMS9230) instead of sweet. Values measured on the phone by the
 a5-ios-port probes (see a5-ios-port/HARDWARE-NOTES.md): GICv3 0x10000000/0x10040000, virtual
@@ -91,7 +91,7 @@ A5_TIMEBASE = 26000000
 A5_VTIMER_INTID = 27
 
 
-def build(seed=None, qemu=False, highmem=False, a5=False, touch_fw=None):
+def build(seed=None, qemu=False, highmem=False, a5=False, touch_fw=None, amp_fw=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     if a5:
@@ -251,6 +251,18 @@ def build(seed=None, qemu=False, highmem=False, a5=False, touch_fw=None):
             ('firmware', fwb[:pram + dram]),
         ])]
 
+    # bsd/dev/sweet_a5_audio.c (A5): FourSemi FS1588 speaker amp register tables.
+    # Comes from the phone's own odm/firmware/frsm-spk1.bin (--amp-fw FILE); never in git.
+    audio = []
+    if a5 and amp_fw:
+        ab = open(amp_fw, 'rb').read()
+        assert len(ab) >= 64 and ab[32:36] == b'INDX', 'not FourSemi frsm firmware'
+        audio = [node('sweet-audio', [
+            ph(),
+            ('compatible', cstr('foursemi,fs1588')),
+            ('fs-firmware', ab),
+        ])]
+
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
     # No effaceable storage: keybagd then reads /private/var/keybags/systembag.kb
@@ -287,12 +299,14 @@ def build(seed=None, qemu=False, highmem=False, a5=False, touch_fw=None):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [emmc] if a5 else [ufs]) + touch)
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [emmc] if a5 else [ufs]) + touch + audio)
 
 
 if __name__ == '__main__':
     tfw = sys.argv[sys.argv.index('--touch-fw') + 1] if '--touch-fw' in sys.argv else None
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, a5='--a5' in sys.argv, touch_fw=tfw)
+    afw = sys.argv[sys.argv.index('--amp-fw') + 1] if '--amp-fw' in sys.argv else None
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, a5='--a5' in sys.argv,
+                 touch_fw=tfw, amp_fw=afw)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

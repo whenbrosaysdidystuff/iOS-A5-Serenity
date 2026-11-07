@@ -1,0 +1,1053 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index cd34080..46451e6 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_emmc.c			standard
+ bsd/dev/sweet_a5_keys.c			standard
+ bsd/dev/sweet_a5_touch.c			standard
++bsd/dev/sweet_a5_audio.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/sweet_a5_audio.c b/bsd/dev/sweet_a5_audio.c
+new file mode 100644
+index 0000000..172e943
+--- /dev/null
++++ b/bsd/dev/sweet_a5_audio.c
+@@ -0,0 +1,953 @@
++/*
++ * Redmi A5 (serenity) audio output: loudspeaker (and headphone jack), as proven bare-metal by
++ * probe V25 (probes/v25-fs-mod): a 1 kHz tone on the speaker.
++ *
++ * Path: AP writes S16LE stereo frames (one 32-bit word each) into MCDT DAC channel 4 ->
++ * audio DSP (AGDSP, firmware loaded and booted by U-Boot) FE "FAST_PLAYBACK" (id 3) -> VBC TX0
++ * -> IIS0 (24 bit, right-high) -> digital codec 0x56750000 -> SC2730 analog codec DAC ->
++ * HP buffer + SC2730 speaker PA (class AB) -> FourSemi FS1588 smart amp (I2C6 0x34, MOD pin
++ * GPIO 58) -> speaker. Register-level sources: Otto Pflueger's mainline UMS9230 drivers
++ * (sprd-agdsp.c, vbc-v4-dsp.c, sprd-mcdt.c, ums9230-digital.c, codecs/sc2730.c) and the
++ * FourSemi frsm_i2ca v5.1.2.1 GPL driver (OPPO ums9230 tree).
++ *
++ *   DSP wake: AON 0x04 bit 2 (mailbox clock), AON 0x14c bit 5 (AP access), mailbox msg 100
++ *   IPC: smem 0x94380000 (1 KiB params, tx ring 64 x 20 B, rx ring 64 x 20 B, 4 pointers),
++ *        mailbox 0x641c0000 core 5. Commands on channel 0: STARTUP 4, SHUTDOWN 5,
++ *        HW_PARAMS 6, HW_TRIGGER 7, KCTL_SET 9.
++ *   MCDT 0x56490000: 512-word FIFO per channel, 10-bit pointers, PIO (no DMA).
++ *
++ * The FS1588 register tables come from the phone's own odm/firmware/frsm-spk1.bin, passed in
++ * the ADT node /sweet-audio "fs-firmware" (tools/mkadt.py --amp-fw), never built into the
++ * kernel. Only volatile amp registers are written (no OTP command exists in this file).
++ *
++ * Userland: /dev/a5audio, write() S16LE stereo 48 kHz (4 bytes per frame); blocks while the
++ * 128 KiB ring is full. ioctl A5AUDIO_SETVOL (0..100) sets a software volume. After 2 s with
++ * no data the stream is stopped and both amplifiers are powered down; the next write starts
++ * them again. Boot-args: a5audio=0 disables the driver, a5chime=0 skips the boot chime.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/ioccom.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern int sweet_a5_adi_read(uint32_t reg, uint32_t *val);
++extern int sweet_a5_adi_write(uint32_t reg, uint32_t val);
++extern int sweet_a5_adi_update(uint32_t reg, uint32_t mask, uint32_t val);
++extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);
++void sweet_a5_audio_init(void);
++
++#define A5AUDIO_SETVOL  _IOW('a', 1, int)
++#define A5AUDIO_GETVOL  _IOR('a', 2, int)
++
++/* ---- physical blocks */
++#define AON_PA          0x64000000u
++#define PMU_PA          0x64020000u
++#define MBOX_PA         0x641c0000u
++#define GPIO_PA         0x641b0000u
++#define AGCP_PA         0x56000000u
++#define MCDT_PA         0x56490000u
++#define DIGC_PA         0x56750000u
++#define I2C6_PA         0x20220000u
++#define APB_PA          0x20000000u
++#define APCLK_PA        0x20010000u
++#define SMEM_PA         0x94380000u
++
++#define SMEM_PARAMS     0x000u          /* 1 KiB command parameters */
++#define SMEM_RING       0x400u
++#define RING_BYTES      0x500u          /* 64 messages of 20 bytes */
++#define RING_N          64u
++#define SMEM_TX         SMEM_RING
++#define SMEM_RX         (SMEM_RING + RING_BYTES)
++#define SMEM_PTRS       (SMEM_RING + 2 * RING_BYTES)   /* txrd, txwr, rxrd, rxwr */
++
++#define AUDCP_CORE      5
++#define FE_FAST         3
++#define MCH             4               /* MCDT DAC channel of FAST_PLAYBACK */
++#define MCDT_FILL_MAX   440u
++#define MOD_GPIO        58u
++#define FS_ADDR         0x34
++
++#define CMD_STARTUP     4
++#define CMD_SHUTDOWN    5
++#define CMD_HW_PARAMS   6
++#define CMD_HW_TRIGGER  7
++#define CMD_KCTL_SET    9
++
++static vm_offset_t aon, pmu, mbox, gpio3, agcp, mcdt, digc, i2c, apb, apclk, smem;
++static bool started, ready;
++static int au_chan;
++static uint32_t rx_rd;
++
++static inline uint32_t rd32(vm_offset_t a) { return *(volatile uint32_t *)a; }
++static inline void wr32(vm_offset_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
++static inline void wr8(vm_offset_t a, uint8_t v) { *(volatile uint8_t *)a = v; }
++
++static void
++sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&au_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static uint32_t
++prd(uint32_t reg)
++{
++	uint32_t v = 0;
++	(void)sweet_a5_adi_read(reg, &v);
++	return v;
++}
++static void pset(uint32_t reg, uint32_t bits) { (void)sweet_a5_adi_update(reg, bits, bits); }
++static void pclr(uint32_t reg, uint32_t bits) { (void)sweet_a5_adi_update(reg, bits, 0); }
++static void pfield(uint32_t reg, uint32_t mask, uint32_t val) { (void)sweet_a5_adi_update(reg, mask, val); }
++
++/* ---- DSP */
++static bool
++dsp_up(void)
++{
++	uint32_t st = rd32(pmu + 0x544);
++	return ((st >> 8) & 0x1f) == 0 && ((st >> 16) & 0x1f) == 0;
++}
++
++static void
++mbox_send(uint32_t lo, uint32_t hi)
++{
++	wr32(mbox + 0x4, lo);
++	wr32(mbox + 0x8, hi);
++	wr32(mbox + 0x0, AUDCP_CORE);
++	wr32(mbox + 0xc, 1);
++}
++
++static void
++ipc_send(uint16_t cmd, uint32_t p0, uint32_t p1, uint32_t p2, uint32_t p3)
++{
++	uint32_t wr = rd32(smem + SMEM_PTRS + 4);
++	vm_offset_t m = smem + SMEM_TX + 20 * (wr % RING_N);
++	wr32(m + 0, cmd);               /* channel 0 in the high half */
++	wr32(m + 4, p0);
++	wr32(m + 8, p1);
++	wr32(m + 12, p2);
++	wr32(m + 16, p3);
++	__builtin_arm_dsb(0xf);
++	wr32(smem + SMEM_PTRS + 4, wr + 1);
++	__builtin_arm_dsb(0xf);
++	mbox_send(1, 0);
++}
++
++/* wait for the reply to cmd on channel 0; its param3 (status), or -1000 on timeout */
++static int
++ipc_wait(uint16_t cmd, uint32_t ms)
++{
++	for (uint32_t t = 0; t <= ms; t++) {
++		while (rx_rd != rd32(smem + SMEM_PTRS + 12)) {
++			vm_offset_t m = smem + SMEM_RX + 20 * (rx_rd % RING_N);
++			uint32_t w0 = rd32(m), p3 = rd32(m + 16);
++			rx_rd++;
++			wr32(smem + SMEM_PTRS + 8, rx_rd);
++			if ((w0 & 0xffff) == cmd && (w0 >> 16) == 0) {
++				return (int)p3;
++			}
++		}
++		if (t < ms) {
++			sleep_ms(1);
++		}
++	}
++	return -1000;
++}
++
++static int
++ipc_cmd(uint16_t cmd, uint32_t id, uint32_t stream, const uint8_t *par, uint32_t n)
++{
++	for (uint32_t i = 0; i < n; i += 4) {
++		uint32_t w = 0;
++		for (uint32_t b = 0; b < 4 && i + b < n; b++) {
++			w |= (uint32_t)par[i + b] << (8 * b);
++		}
++		wr32(smem + SMEM_PARAMS + i, w);
++	}
++	ipc_send(cmd, id, stream, SMEM_PA + SMEM_PARAMS, 0);
++	return ipc_wait(cmd, 2000);
++}
++
++static int
++kctl(uint32_t ctl, uint32_t id, uint32_t val)
++{
++	uint8_t p[8];
++	for (int b = 0; b < 4; b++) {
++		p[b] = (uint8_t)(id >> (8 * b));
++		p[4 + b] = (uint8_t)(val >> (8 * b));
++	}
++	return ipc_cmd(CMD_KCTL_SET, ctl, 0xffffffffu, p, 8);
++}
++
++/* startup parameters: packed, 618 bytes, field order of vbc-v4-dsp.h struct vbc_startup_params */
++static uint8_t sp[640];
++static uint32_t spo;
++static void sp32(uint32_t v) { for (int b = 0; b < 4; b++) { sp[spo++] = (uint8_t)(v >> (8 * b)); } }
++static void
++sppair(int n, uint32_t val)
++{
++	for (int i = 0; i < n; i++) {
++		sp32((uint32_t)i);
++		sp32(val);
++	}
++}
++static void
++build_startup(void)
++{
++	spo = 0;
++	for (int i = 0; i < 32; i++) {
++		sp[spo++] = 0;                          /* stream_name */
++	}
++	sp32(FE_FAST); sp32(0); sp32(0); sp32(0); sp32(0);      /* fe_id stream tx_id rx_id ref_rx_id */
++	sppair(4, 0);           /* rx_source */
++	sppair(2, 0);           /* tx_out */
++	sppair(3, 0);           /* mux_tx: TX0..2 -> IIS0 */
++	sppair(4, 0);           /* mux_rx */
++	sppair(5, 0);           /* iis_do */
++	sppair(3, 1);           /* tx_wd: 24 bit */
++	sppair(3, 1);           /* tx_lr_mod: right high */
++	sppair(4, 0);           /* rx_wd */
++	sppair(4, 0);           /* rx_lr_mod */
++	for (int i = 0; i < 4; i++) {
++		sp32(0);                                /* loopback */
++	}
++	sp32(0); sp32(0);                               /* iis_master */
++	for (int i = 0; i < 4; i++) {
++		sp32(0); sp32((uint32_t)i); sp32(0); sp32(0);   /* mdg */
++	}
++	for (int i = 0; i < 6; i++) {
++		sp32(0);                                /* smthdg[1] */
++	}
++	for (int i = 0; i < 2; i++) {                   /* mixerdg */
++		sp32(0); sp32((uint32_t)i); sp32((uint32_t)i); sp32(0);
++		sp32(0); sp32((uint32_t)i); sp32(0); sp32(0);
++	}
++	sp32(0);                                        /* mixerdg_step */
++	for (int i = 0; i < 5; i++) {
++		sp32(0); sp32((uint32_t)i); sp32(0);    /* mixer: NOT_MIX */
++	}
++	for (int i = 0; i < 7; i++) {
++		sp32(0);                                /* sbcenc */
++	}
++	sp32(0); sp32(0);                               /* ivsense */
++	sppair(4, 0);           /* mst_sel */
++	sp[spo++] = 0;
++	sp[spo++] = 0;                                  /* voice_record_type */
++}
++
++static int
++scene_start(void)
++{
++	build_startup();
++	int r1 = ipc_cmd(CMD_STARTUP, FE_FAST, 0, sp, spo);
++	uint8_t hw[52] = { 0 };                         /* name[32], fe, stream, channels, rate, format */
++	hw[32] = FE_FAST;
++	hw[40] = 2;
++	hw[44] = 0;                                     /* 48 kHz */
++	hw[48] = 3;                                     /* VBC_DAT_L16 */
++	int r2 = ipc_cmd(CMD_HW_PARAMS, FE_FAST, 0, hw, sizeof(hw));
++	int r3 = kctl(2 /* SRC */, 0, 48000);
++	int r4 = 0;
++	for (uint32_t i = 0; i < 3; i++) {
++		r4 |= kctl(29 /* IIS_TX_WIDTH_SEL */, i, 1);
++		r4 |= kctl(30 /* IIS_TX_LRMOD_SEL */, i, 1);
++	}
++	printf("SWEET A5 AUDIO: scene startup %d hw_params %d src %d iis %d (%u bytes)\n", r1, r2, r3, r4, spo);
++	return (r1 || r2) ? -1 : 0;
++}
++
++static void
++scene_stop(void)
++{
++	(void)ipc_cmd(CMD_SHUTDOWN, FE_FAST, 0, sp, spo);
++}
++
++/* ---- MCDT */
++static uint32_t
++mcdt_ptrs(void)
++{
++	return rd32(mcdt + 0xe4 + 4 * MCH);
++}
++static uint32_t
++mcdt_fill(void)
++{
++	uint32_t v = mcdt_ptrs();
++	return ((v & 0x3ff) - ((v >> 16) & 0x3ff)) & 0x3ff;
++}
++
++static void
++stream_trigger(bool on)
++{
++	if (on) {
++		wr32(mcdt + 0x158, rd32(mcdt + 0x158) | (1u << MCH));        /* clear the FIFO */
++		wr32(mcdt + 0x60 + 4 * MCH, (320u << 16) | 511u);               /* watermarks */
++		for (int i = 0; i < 400; i++) {
++			wr32(mcdt + 4 * MCH, 0);
++		}
++	}
++	ipc_send(CMD_HW_TRIGGER, FE_FAST, 0, on ? 1 : 0, 0);
++	(void)ipc_wait(CMD_HW_TRIGGER, 20);
++}
++
++/* ---- codec (SC2730 analog over ADI + digital codec) */
++static void
++codec_on(void)
++{
++	pset(0x1808, 1u << 4);                          /* MODULE_EN: ANA_AUD_EN */
++	(void)sweet_a5_adi_write(0x0140, 0);            /* AUD_AUDIF_CTL0 */
++	pset(0x180c, (1u << 7) | (1u << 1) | 1u);       /* CLK_EN: AUD_SCLK, AUDIF_6M5, AUDIF */
++	pset(0x0100, 1u << 1);                          /* AUD_TOPA_CLK_EN: TOPA_6M5 */
++	pset(0x1068, (1u << 15) | (1u << 13) | (1u << 12) | (1u << 11));      /* ANA_CLK0 */
++	pset(0x1000, (1u << 13) | (1u << 9) | (1u << 4));       /* ANA_PMU0: VB BG BIAS */
++	pset(0x1100, (1u << 9) | (1u << 1));            /* ANA_DCL1: DIG_CLK, DRV_SOFT */
++	sleep_ms(5);
++	pset(0x1068, (1u << 8) | (1u << 7));            /* CLK_DAC, CLK_CP */
++	pset(0x1100, 1u << 4);                          /* DIG_CLK_HPDPOP */
++	pset(0x1000, 1u << 1);                          /* CP_LDO */
++	pset(0x1124, (1u << 11) | (1u << 5));           /* DCL10: CP soft enable */
++	delay(110);
++	pclr(0x101c, (1u << 10) | (1u << 9) | (1u << 8));       /* PMU7 */
++	pset(0x1000, 1u << 2);                          /* CP_AD_EN */
++	delay(80);
++	pset(0x1000, 1u << 3);                          /* CP_EN */
++	pset(0x0108, (1u << 2) | (1u << 4));            /* AUD_LP_MODULE_CTRL: DAC_EN_L/R */
++	pset(0x1088, (1u << 4) | (1u << 3));            /* ANA_CDC5: DACL DACR */
++	pset(0x109c, 1u << 1);                          /* ANA_CDC10: HP BUF */
++	pset(0x1098, (1u << 3) | (1u << 2));            /* ANA_CDC9: HP switches */
++	pfield(0x1090, 0xffu, 0x77);                    /* ANA_CDC7: HP volume */
++	pset(0x109c, (1u << 3) | (1u << 2));            /* ANA_CDC10: HPL HPR */
++	sleep_ms(60);
++	wr32(digc + 0x0, rd32(digc + 0x0) | 5);         /* digital codec: DACL/DACR */
++	wr32(digc + 0xc, (rd32(digc + 0xc) & ~0xfu) | 1);       /* 48 kHz */
++}
++
++/* SC2730 speaker PA, stock route "speaker" (DACLSPKL + Speaker Function), class AB, PA_G 6 */
++static void
++spk_pa_setup(void)
++{
++	pset(0x1068, 1u << 2);                          /* ANA_CLK0 CLK_PA_32K */
++	pset(0x1100, (1u << 0) | (1u << 2));            /* ANA_DCL1 DIG_CLK_PA, DIG_CLK_FGU */
++	pfield(0x1094, 0xfu, 0x6);                      /* CDC8 PA_G */
++	pfield(0x10b8, 0x1fu << 11, 0);                 /* CDC17 PA_RSV */
++	pset(0x108c, 1u << 3);                          /* CDC6 DAS_EN */
++	delay(110);
++	pfield(0x10c0, 3u << 6, 3u << 6);               /* CDC19 DPOP_RC_L */
++	delay(15);
++	pfield(0x10b8, 0x1fu << 11, 8u << 11);
++	sleep_ms(20);
++	pfield(0x10c0, 3u << 6, 0);
++	delay(110);
++	pset(0x1098, 1u << 4);                          /* CDC9 SDAPA */
++	pfield(0x108c, 7u, 1u | (1u << 2));             /* DAS DC offset */
++	pclr(0x10ac, (1u << 5) | (1u << 0));            /* CDC14: class AB, depop */
++}
++
++static bool
++spk_pa(bool on)
++{
++	if (!on) {
++		pclr(0x10ac, 1u << 6);
++		return true;
++	}
++	pset(0x10ac, 1u << 6);                          /* PA_EN */
++	sleep_ms(60);
++	for (int i = 0; i < 135; i++) {
++		if (prd(0x11b0) & (1u << 8)) {          /* STS11 PA_AB_DPOP_DVLD */
++			return true;
++		}
++		sleep_ms(1);
++	}
++	return false;
++}
++
++/* ---- GPIO 58 (FS1588 MOD) */
++static void
++mod_pin(bool high)
++{
++	uint32_t bit = 1u << (MOD_GPIO % 16);
++	wr32(gpio3 + 0x4, rd32(gpio3 + 0x4) | bit);     /* DMSK */
++	wr32(gpio3 + 0x8, rd32(gpio3 + 0x8) | bit);     /* DIR = out */
++	wr32(gpio3 + 0x0, high ? (rd32(gpio3) | bit) : (rd32(gpio3) & ~bit));
++}
++
++/* ---- I2C6 (sprd i2c, polled; register layout of mainline i2c-sprd.c) */
++static void
++i2c_setup(void)
++{
++	wr32(apb + 0x1000, 1u << 27);                   /* AP APB EB set: I2C6_EB */
++	wr32(apclk + 0x48, 0);                          /* ap-i2c6-clk: 26 MHz */
++	delay(10);
++	wr32(i2c + 0x00, 1u << 8);                      /* DVD_OPT */
++	wr32(i2c + 0x00, (rd32(i2c) & ~(0xfu << 16)) | (15u << 16));
++	wr32(i2c + 0x00, (rd32(i2c) & ~(0xfu << 12)) | (4u << 12));
++	wr32(i2c + 0x20, (51u << 16) | 76u);            /* 100 kHz */
++	wr32(i2c + 0x24, 0);
++	wr32(i2c + 0x28, 104);
++	wr32(i2c + 0x2c, 1);
++	wr32(i2c + 0x14, rd32(i2c + 0x14) & ~4u);
++	wr32(i2c + 0x00, rd32(i2c) | (1u << 2) | (1u << 1) | (1u << 21) | (1u << 22));
++}
++
++static int
++i2c_msg(uint8_t *buf, uint32_t len, bool rd, bool last)
++{
++	wr32(i2c + 0x2c, 1);                            /* reset the FIFO */
++	wr32(i2c + 0x04, (uint32_t)FS_ADDR << 1);
++	wr32(i2c + 0x08, len);
++	uint32_t c = rd32(i2c) & ~(1u << 3);
++	c |= (uint32_t)rd << 3;
++	if (rd || last) {
++		c &= ~(1u << 20);
++	} else {
++		c |= 1u << 20;                          /* no stop: repeated start follows */
++	}
++	wr32(i2c, c);
++	if (!rd) {
++		for (uint32_t k = 0; k < len; k++) {
++			wr8(i2c + 0x10, buf[k]);
++		}
++	}
++	wr32(i2c, rd32(i2c) | 1u);                      /* start */
++	bool done = false;
++	for (int t = 0; t < 2000; t++) {                /* <= 20 ms */
++		if (rd32(i2c + 0x14) & 4u) {
++			done = true;
++			break;
++		}
++		delay(10);
++	}
++	bool ack = !(rd32(i2c + 0x14) & 2u);
++	if (done && ack && rd) {
++		for (uint32_t k = 0; k < len; k++) {
++			buf[k] = (uint8_t)rd32(i2c + 0x0c);
++		}
++	}
++	wr32(i2c + 0x14, rd32(i2c + 0x14) & ~2u);
++	wr32(i2c, rd32(i2c) & ~1u);
++	wr32(i2c + 0x14, rd32(i2c + 0x14) & ~4u);
++	return !done ? -2 : (!ack ? -1 : 0);
++}
++
++static uint32_t fs_fails;
++static int
++fs_wr(uint8_t reg, uint16_t val)
++{
++	uint8_t b[3] = { reg, (uint8_t)(val >> 8), (uint8_t)val };
++	int e = i2c_msg(b, 3, false, true);
++	if (e) {
++		fs_fails++;
++	}
++	return e;
++}
++static int
++fs_rd(uint8_t reg, uint16_t *val)
++{
++	uint8_t b[2] = { reg, 0 };
++	int e = i2c_msg(b, 1, false, false);
++	if (!e) {
++		e = i2c_msg(b, 2, true, true);
++	}
++	if (!e) {
++		*val = (uint16_t)(b[0] << 8 | b[1]);
++	} else {
++		fs_fails++;
++	}
++	return e;
++}
++static int
++fs_upd(uint8_t reg, uint16_t mask, uint16_t val)
++{
++	uint16_t o = 0;
++	int e = fs_rd(reg, &o);
++	return e ? e : fs_wr(reg, (uint16_t)((o & ~mask) | (val & mask)));
++}
++
++/* ---- frsm-spk1.bin: 32-byte header, INDX table of {type, offset}, tables of u16 size + body */
++static const uint8_t *fw;
++static uint32_t fw_len;
++static uint16_t u16le(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
++
++static const uint8_t *
++fw_table(uint16_t type)
++{
++	if (fw_len < 38) {
++		return NULL;
++	}
++	const uint8_t *idx = fw + 32;                   /* "INDX" */
++	uint32_t n = u16le(idx + 4) / 4;
++	for (uint32_t i = 0; i < n && 32 + 6 + 4 * i + 4 <= fw_len; i++) {
++		if (u16le(idx + 6 + 4 * i) == type) {
++			uint32_t off = 32u + u16le(idx + 6 + 4 * i + 2);
++			return off + 6 <= fw_len ? fw + off : NULL;
++		}
++	}
++	return NULL;
++}
++
++static int
++fw_write_reg_table(uint16_t off)
++{
++	const uint8_t *rt = fw_table(4);
++	if (!rt || off == 0xffff || (uint32_t)(rt - fw) + off + 2 > fw_len) {
++		return -10;
++	}
++	const uint8_t *t = rt + off;
++	uint32_t size = u16le(t);
++	const uint8_t *p = t + 2;
++	if ((uint32_t)(p - fw) + size > fw_len) {
++		return -12;
++	}
++	for (uint32_t k = 0; k < size;) {
++		uint8_t c = p[k];
++		if (c <= 0xf8 && k + 3 <= size) {
++			fs_wr(c, u16le(p + k + 1));
++			k += 3;
++		} else if (c == 0xfd && k + 6 <= size) {
++			fs_upd(p[k + 1], u16le(p + k + 4), u16le(p + k + 2));
++			k += 6;
++		} else if (c == 0xff && k + 3 <= size) {
++			uint16_t ms = u16le(p + k + 1);
++			sleep_ms(ms ? ms : 1);
++			k += 3;
++		} else {
++			return -11;
++		}
++	}
++	return 0;
++}
++
++/* frsm_i2ca: set address (MOD high), i2c reset, init table (scene 0), scene MUSIC (1); amp left off */
++static int
++fs_init(void)
++{
++	const uint8_t *sc = fw_table(2);
++	if (!sc || (uint32_t)(sc - fw) + 6 + 16 > fw_len) {
++		return -20;
++	}
++	const uint8_t *s0 = sc + 6, *s1 = sc + 6 + 8;
++	uint16_t v = 0, a0 = 0;
++	mod_pin(false);
++	i2c_setup();
++	if (fs_rd(0x01, &v)) {
++		mod_pin(true);
++		delay(1300);
++		fs_rd(0x01, &v);
++	}
++	fs_rd(0x0f, &a0);
++	if (a0 == FS_ADDR) {
++		fs_wr(0x10, 0x0001);
++	}
++	mod_pin(true);                                  /* stays high */
++	delay(1300);
++	printf("SWEET A5 AUDIO: FS1588 devid %04x addr %04x fw chip %04x\n", v, a0, u16le(fw + 14));
++	fs_wr(0x10, 0x0003);                            /* i2c reset */
++	sleep_ms(5);
++	int i;
++	for (i = 0; i < 20; i++) {
++		if (!fs_rd(0x0e, &v) && (v & 3) == 3) {
++			break;
++		}
++		sleep_ms(2);
++	}
++	if (i == 20) {
++		return -21;
++	}
++	int r = fw_write_reg_table(u16le(s0 + 2));
++	if (r) {
++		return r;
++	}
++	fs_rd(0x3f, &v);
++	if (v & 0x8000) {
++		fs_wr(0x3f, v & 0x7fff);
++		sleep_ms(8);
++	}
++	fs_wr(0x11, 0x0000);                            /* mute */
++	fs_wr(0x10, 0x0001);                            /* power down */
++	fs_wr(0x1f, 0x5a5a);
++	uint16_t key = 0;
++	fs_rd(0x1f, &key);
++	r = fw_write_reg_table(u16le(s1 + 2));
++	if (r) {
++		return r - 100;
++	}
++	fs_wr(0x1f, key);
++	fs_rd(0x3f, &v);
++	fs_upd(0x3f, 0x8000, v & 0x8000);
++	return 0;
++}
++
++static void
++fs_amp(bool on)
++{
++	if (on) {
++		fs_wr(0x10, 0x0000);                    /* start */
++		sleep_ms(5);
++		fs_wr(0x11, 0x00c0);                    /* unmute */
++	} else {
++		fs_wr(0x11, 0x0000);
++		fs_wr(0x10, 0x0001);
++	}
++}
++
++/* ---- ring (single producer: the one open writer; single consumer: the feed thread) */
++#define RING_SIZE       (128u * 1024u)
++static uint8_t ring[RING_SIZE] __attribute__((aligned(64)));
++static volatile uint32_t ring_wr, ring_rd;      /* free-running byte counters */
++static LCK_GRP_DECLARE(a5au_grp, "sweet_a5_audio");
++static LCK_MTX_DECLARE(a5au_lock, &a5au_grp);
++static int ring_space_chan, feed_chan;
++static bool dev_open, writer_waiting;
++static int32_t gain_q15 = 23000;                /* ~ 70 % (perceptual) */
++static int volume = 70;
++
++static uint32_t
++ring_used(void)
++{
++	return __atomic_load_n(&ring_wr, __ATOMIC_ACQUIRE) - __atomic_load_n(&ring_rd, __ATOMIC_ACQUIRE);
++}
++
++/* ---- feed thread: keeps MCDT topped up, starts/stops the stream and the amps */
++static bool streaming;
++static uint32_t underruns, restarts;
++
++static bool
++stream_start(void)
++{
++	if (!spk_pa(true)) {
++		printf("SWEET A5 AUDIO: speaker PA not ready\n");
++	}
++	stream_trigger(true);
++	fs_amp(true);
++	streaming = true;
++	return true;
++}
++
++static void
++stream_stop(void)
++{
++	fs_amp(false);
++	spk_pa(false);
++	stream_trigger(false);
++	streaming = false;
++}
++
++static uint32_t
++next_word(void)
++{
++	uint32_t rd = ring_rd;
++	uint32_t w = *(uint32_t *)(void *)&ring[rd % RING_SIZE];
++	__atomic_store_n(&ring_rd, rd + 4, __ATOMIC_RELEASE);
++	int32_t l = (int16_t)(w & 0xffff), r = (int16_t)(w >> 16);
++	l = (l * gain_q15) >> 15;
++	r = (r * gain_q15) >> 15;
++	return ((uint32_t)l & 0xffff) | ((uint32_t)r << 16);
++}
++
++static void
++feed_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t idle_since = 0, stuck_since = 0, now, tps;
++	uint32_t last_r = 0;
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &tps);
++
++	for (;;) {
++		if (!streaming) {
++			lck_mtx_lock(&a5au_lock);
++			while (ring_used() < 4) {
++				lck_mtx_sleep(&a5au_lock, LCK_SLEEP_DEFAULT, (event_t)&feed_chan, THREAD_UNINT);
++			}
++			lck_mtx_unlock(&a5au_lock);
++			stream_start();
++			idle_since = stuck_since = 0;
++			last_r = mcdt_ptrs() >> 16;
++		}
++		now = mach_absolute_time();
++		uint32_t fill = mcdt_fill(), wrote = 0;
++		if (fill == 0) {
++			underruns++;
++		}
++		while (fill < MCDT_FILL_MAX) {
++			wr32(mcdt + 4 * MCH, ring_used() >= 4 ? next_word() : 0);
++			fill++;
++			wrote++;
++		}
++		/* wake a blocked writer once a quarter of the ring is free */
++		if (writer_waiting && RING_SIZE - ring_used() >= RING_SIZE / 4) {
++			lck_mtx_lock(&a5au_lock);
++			writer_waiting = false;
++			wakeup(&ring_space_chan);
++			lck_mtx_unlock(&a5au_lock);
++		}
++		if (ring_used() >= 4) {
++			idle_since = 0;
++		} else if (!idle_since) {
++			idle_since = now;
++		} else if (now - idle_since > 2 * tps) {
++			stream_stop();
++			printf("SWEET A5 AUDIO: idle, stopped (underruns %u, restarts %u)\n", underruns, restarts);
++			continue;
++		}
++		/* the DSP must keep draining the FIFO; if it stalls for 200 ms, start the scene again */
++		uint32_t r = mcdt_ptrs() >> 16;
++		if (r != last_r) {
++			last_r = r;
++			stuck_since = 0;
++		} else if (!stuck_since) {
++			stuck_since = now;
++		} else if (now - stuck_since > tps / 5) {
++			printf("SWEET A5 AUDIO: DSP stopped draining, restarting the scene\n");
++			restarts++;
++			fs_amp(false);
++			scene_stop();
++			scene_start();
++			stream_trigger(true);
++			fs_amp(true);
++			stuck_since = 0;
++		}
++		(void)wrote;
++		sleep_ms(2);
++	}
++}
++
++/* ---- boot chime: two short notes with a decaying envelope */
++static const int16_t sine48[48] = {
++	0, 4277, 8481, 12539, 16384, 19947, 23170, 25996, 28378, 30273, 31651, 32487,
++	32767, 32487, 31651, 30273, 28378, 25996, 23170, 19947, 16384, 12539, 8481, 4277,
++	0, -4277, -8481, -12539, -16384, -19947, -23170, -25996, -28378, -30273, -31651, -32487,
++	-32767, -32487, -31651, -30273, -28378, -25996, -23170, -19947, -16384, -12539, -8481, -4277 };
++
++static void
++chime(void)
++{
++	static const uint32_t note_hz[2] = { 880, 1320 };
++	uint32_t n = 0;
++	for (int k = 0; k < 2; k++) {
++		uint32_t len = 48000 * 180 / 1000, ph = 0, step = note_hz[k] * 65536u / 1000u;
++		for (uint32_t i = 0; i < len && n + 4 <= RING_SIZE; i++) {
++			int32_t env = (int32_t)(10000 - 10000 * i / len);
++			int32_t s = sine48[(ph >> 16) % 48] * env / 32767;
++			ph += step;
++			uint32_t w = ((uint32_t)s & 0xffff) | ((uint32_t)s << 16);
++			*(uint32_t *)(void *)&ring[n] = w;
++			n += 4;
++		}
++	}
++	__atomic_store_n(&ring_wr, n, __ATOMIC_RELEASE);
++}
++
++/* ---- /dev/a5audio */
++static int
++a5au_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	int err = 0;
++	lck_mtx_lock(&a5au_lock);
++	if (!ready) {
++		err = ENXIO;
++	} else if (dev_open) {
++		err = EBUSY;
++	} else {
++		dev_open = true;
++	}
++	lck_mtx_unlock(&a5au_lock);
++	return err;
++}
++
++static int
++a5au_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	lck_mtx_lock(&a5au_lock);
++	dev_open = false;
++	lck_mtx_unlock(&a5au_lock);
++	return 0;
++}
++
++static int
++a5au_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	int err = 0;
++	while (uio_resid(uio) > 0) {
++		uint32_t used = ring_used();
++		uint32_t space = RING_SIZE - used;
++		if (space < 4) {
++			lck_mtx_lock(&a5au_lock);
++			writer_waiting = true;
++			if (RING_SIZE - ring_used() < 4) {
++				err = msleep(&ring_space_chan, &a5au_lock, PCATCH | PZERO, "a5audio", NULL);
++			}
++			lck_mtx_unlock(&a5au_lock);
++			if (err) {
++				break;
++			}
++			continue;
++		}
++		uint32_t wr = ring_wr, off = wr % RING_SIZE;
++		uint32_t n = space;
++		if (n > RING_SIZE - off) {
++			n = RING_SIZE - off;
++		}
++		if ((user_ssize_t)n > uio_resid(uio)) {
++			n = (uint32_t)uio_resid(uio);
++		}
++		err = uiomove((caddr_t)&ring[off], (int)n, uio);
++		if (err) {
++			break;
++		}
++		__atomic_store_n(&ring_wr, wr + n, __ATOMIC_RELEASE);
++		if (!streaming) {
++			lck_mtx_lock(&a5au_lock);
++			thread_wakeup((event_t)&feed_chan);
++			lck_mtx_unlock(&a5au_lock);
++		}
++	}
++	return err;
++}
++
++static int
++a5au_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused proc_t p)
++{
++	switch (cmd) {
++	case A5AUDIO_SETVOL: {
++		int v = *(int *)(void *)data;
++		v = v < 0 ? 0 : v > 100 ? 100 : v;
++		volume = v;
++		gain_q15 = (int32_t)(32767 * v * v / 10000);
++		return 0;
++	}
++	case A5AUDIO_GETVOL:
++		*(int *)(void *)data = volume;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static const struct cdevsw a5au_cdevsw = {
++	.d_open       = a5au_open,
++	.d_close      = a5au_close,
++	.d_read       = eno_rdwrt,
++	.d_write      = a5au_write,
++	.d_ioctl      = a5au_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++/* ---- bring-up: everything that waits runs on the feed thread, not in the boot path */
++static void
++audio_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t chime_on = 1;
++	PE_parse_boot_argn("a5chime", &chime_on, sizeof(chime_on));
++
++	wr32(aon + 0x04, rd32(aon + 0x04) | 4);         /* mailbox clock */
++	delay(1000);
++	wr32(aon + 0x14c, rd32(aon + 0x14c) | 0x20);    /* AP access */
++	mbox_send(100, 0);
++	for (int i = 0; i < 200 && !dsp_up(); i++) {
++		sleep_ms(1);
++	}
++	if (!dsp_up()) {
++		printf("SWEET A5 AUDIO: DSP did not wake (PMU 0x544 = %08x)\n", rd32(pmu + 0x544));
++		return;
++	}
++	rx_rd = rd32(smem + SMEM_PTRS + 8);
++	(void)ipc_wait(0xffff, 50);                     /* drain BOOT_OK etc. */
++	wr32(agcp + 0x1000, (1u << 19) | (1u << 12));   /* AUD_EB, MCDT_EB */
++	wr32(agcp, rd32(agcp) | (1u << 19) | (1u << 12));
++	delay(1000);
++
++	codec_on();
++	if (scene_start()) {
++		printf("SWEET A5 AUDIO: the DSP refused the playback scene\n");
++		return;
++	}
++	if (!(rd32(agcp) & (1u << 12))) {
++		printf("SWEET A5 AUDIO: MCDT clock off after startup (EB %08x)\n", rd32(agcp));
++		scene_stop();
++		return;
++	}
++	spk_pa_setup();
++	int r = fs_init();
++	printf("SWEET A5 AUDIO: FS1588 init %d (%u i2c errors)\n", r, fs_fails);
++
++	int major = cdevsw_add(-1, &a5au_cdevsw);
++	if (major < 0) {
++		printf("SWEET A5 AUDIO: cdevsw_add failed\n");
++		return;
++	}
++	devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "a5audio");
++	lck_mtx_lock(&a5au_lock);
++	ready = true;
++	lck_mtx_unlock(&a5au_lock);
++	printf("SWEET A5 AUDIO: ready, /dev/a5audio (S16LE stereo 48 kHz)\n");
++	if (chime_on) {
++		chime();
++	}
++	feed_thread(NULL, THREAD_AWAKENED);
++}
++
++void
++sweet_a5_audio_init(void)
++{
++	uint32_t on = 1;
++	thread_t thread;
++
++	if (started) {
++		return;
++	}
++	started = true;
++	PE_parse_boot_argn("a5audio", &on, sizeof(on));
++	if (!on) {
++		printf("SWEET A5 AUDIO: disabled (a5audio=0)\n");
++		return;
++	}
++	DTEntry node;
++	const void *prop = NULL;
++	unsigned int size = 0;
++	if (SecureDTLookupEntry(NULL, "/sweet-audio", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "fs-firmware", &prop, &size) != kSuccess || size < 64) {
++		printf("SWEET A5 AUDIO: no amp firmware in the device tree (/sweet-audio fs-firmware)\n");
++		return;
++	}
++	fw = prop;
++	fw_len = size;
++	aon = ml_io_map(AON_PA, 0x1000);
++	pmu = ml_io_map(PMU_PA, 0x1000);
++	mbox = ml_io_map(MBOX_PA, 0x1000);
++	gpio3 = ml_io_map(GPIO_PA, 0x1000) + (MOD_GPIO / 16) * 0x80;
++	agcp = ml_io_map(AGCP_PA, 0x2000);
++	mcdt = ml_io_map(MCDT_PA, 0x1000);
++	digc = ml_io_map(DIGC_PA, 0x1000);
++	i2c = ml_io_map(I2C6_PA, 0x1000);
++	apb = ml_io_map(APB_PA, 0x2000);
++	apclk = ml_io_map(APCLK_PA, 0x1000);
++	smem = ml_io_map(SMEM_PA, 0x1000);
++	if (kernel_thread_start_priority(audio_thread, NULL, 95, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET A5 AUDIO: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_a5_keys.c b/bsd/dev/sweet_a5_keys.c
+index 525cc67..d3009aa 100644
+--- a/bsd/dev/sweet_a5_keys.c
++++ b/bsd/dev/sweet_a5_keys.c
+@@ -144,6 +144,48 @@ adi_write_locked(uint32_t reg, uint32_t v)
+ 	return i == 100000 ? 2 : 0;
+ }
+ 
++/* shared with bsd/dev/sweet_a5_audio.c (SC2730 audio codec registers) */
++int sweet_a5_adi_read(uint32_t reg, uint32_t *val);
++int sweet_a5_adi_write(uint32_t reg, uint32_t val);
++int sweet_a5_adi_update(uint32_t reg, uint32_t mask, uint32_t val);
++
++static void
++adi_map(void)
++{
++	if (adi == 0) {
++		adi = ml_io_map(ADI_PA, ADI_MAP_SIZE);
++	}
++}
++
++int
++sweet_a5_adi_read(uint32_t reg, uint32_t *val)
++{
++	adi_map();
++	return adi_read(reg, val);
++}
++
++int
++sweet_a5_adi_write(uint32_t reg, uint32_t val)
++{
++	adi_map();
++	return adi_write(reg, val);
++}
++
++/* read-modify-write under one hold of the ADI lock */
++int
++sweet_a5_adi_update(uint32_t reg, uint32_t mask, uint32_t val)
++{
++	uint32_t v = 0;
++	adi_map();
++	lck_mtx_lock(&a5_adi_lock);
++	int rc = adi_read_locked(reg, &v);
++	if (rc == 0) {
++		rc = adi_write_locked(reg, (v & ~mask) | (val & mask));
++	}
++	lck_mtx_unlock(&a5_adi_lock);
++	return rc;
++}
++
+ static void
+ keys_wait(void)
+ {
+@@ -280,7 +322,7 @@ sweet_a5_keys_init(void)
+ 		printf("SWEET A5 KEYS: disabled (a5keys=0)\n");
+ 		return;
+ 	}
+-	adi = ml_io_map(ADI_PA, ADI_MAP_SIZE);
++	adi_map();
+ 	gpio_bank = ml_io_map(GPIO_PA, 0x1000) + GPIO_BANK * 0x80u;
+ 	rtc_sync();
+ 
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index e34bb59..eed3c94 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -59,6 +59,7 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern void sweet_a5_keys_init(void);
+ extern void sweet_a5_touch_init(void);
++extern void sweet_a5_audio_init(void);
+ 
+ #define SD_BLKCNT32     0x00
+ #define SD_BLKSZ        0x04            /* + 16-bit count at 0x06: write both as one u32 */
+@@ -766,6 +767,7 @@ sweet_emmc_init(void)
+ 	/* A5 input: the buttons (bsd/dev/sweet_a5_keys.c) start with the root device */
+ 	sweet_a5_keys_init();
+ 	sweet_a5_touch_init();
++	sweet_a5_audio_init();
+ 	return 0;
+ }
+ 
