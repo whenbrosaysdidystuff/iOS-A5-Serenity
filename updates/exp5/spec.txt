@@ -1,0 +1,10 @@
+# Experiment 5 = experiment 4 with an a5update that streams the log (exp4's a5update held the whole
+# 64 MiB in memory and was most likely killed by jetsam before writing anything). Collect on the
+# boot after applying.
+FILE    ../../userland/a5update/out/a5update /usr/libexec/a5update 0755 0 0
+LIST    /private/var/db/diagnostics/Persist
+COLLECT /private/var/mobile/Library/Logs/a5 2048
+COLLECT /private/var/db/diagnostics/timesync 2048
+COLLECT /private/var/db/uuidtext/31/96333F5A48373BB4270146DC1177FB 4096
+COLLECT /private/var/db/diagnostics/Special 4096
+COLLECT /private/var/db/diagnostics/Persist 12288

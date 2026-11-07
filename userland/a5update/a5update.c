@@ -20,8 +20,9 @@
  * log run every boot.
  *
  * Log area: "A5LOG001", u32 length, then text: what was applied, then "=== path (n bytes) ===" +
- * contents for every collected file. tools/a5log.py prints it. The last 4 MiB of earlier boots'
- * logs are kept in /private/var/db/a5update.history and come first.
+ * contents for every collected file (exact byte count in the header; directories newest name
+ * first, until the 64 MiB area is full). It is written as it goes, so a5update stays small in
+ * memory. Each collect round replaces the previous one. tools/a5log.py prints / extracts it.
  * Sounds (/dev/a5audio): two short high beeps = update applied, one low beep = update failed.
  */
 #include <fcntl.h>
@@ -43,8 +44,6 @@
 #define LOG_MAX         (64u << 20)
 #define MAX_PAYLOAD     (200u << 20)
 #define MAX_COLLECT     32
-#define HISTORY_PATH    "/private/var/db/a5update.history"
-#define HISTORY_MAX     (4u << 20)
 
 struct hdr {
 	char magic[8];
@@ -52,42 +51,47 @@ struct hdr {
 	unsigned int count, payload_len, payload_crc, flags;
 };
 
-static char *logbuf;
-static unsigned int loglen;
+/* the log is streamed into the log area: text through a small buffer, collected files in chunks */
+static int logfd = -1;
+static char tbuf[1u << 20];
+static unsigned int tlen;
+static unsigned long long logpos, logbase;      /* bytes of log body on the device */
 
 static void
-logf_(const char *fmt, ...)
+log_header(void)
 {
-	va_list ap;
-	if (!logbuf || loglen >= LOG_MAX - 1024) {
-		return;
-	}
-	va_start(ap, fmt);
-	int n = vsnprintf(logbuf + loglen, LOG_MAX - loglen - 1, fmt, ap);
-	va_end(ap);
-	if (n > 0) {
-		loglen += (unsigned)n < LOG_MAX - loglen - 1 ? (unsigned)n : LOG_MAX - loglen - 1;
-	}
+	char h[12];
+	unsigned int n = (unsigned int)logpos;
+	memcpy(h, "A5LOG001", 8);
+	memcpy(h + 8, &n, 4);
+	(void)pwrite(logfd, h, sizeof(h), LOG_OFF);
 }
 
 static void
 log_flush(void)
 {
-	int fd = open(DEV, O_WRONLY);
-	if (fd < 0) {
+	if (logfd < 0 || !tlen) {
 		return;
 	}
-	/* whole 512-byte sectors: header + text, zero padded */
-	unsigned int total = 12 + loglen, padded = (total + 511) & ~511u;
-	char *b = calloc(1, padded);
-	if (b) {
-		memcpy(b, "A5LOG001", 8);
-		memcpy(b + 8, &loglen, 4);
-		memcpy(b + 12, logbuf, loglen);
-		(void)pwrite(fd, b, padded, LOG_OFF);
-		free(b);
+	(void)pwrite(logfd, tbuf, tlen, LOG_OFF + 12 + (off_t)logpos);
+	logpos += tlen;
+	tlen = 0;
+	log_header();
+}
+
+static void
+logf_(const char *fmt, ...)
+{
+	va_list ap;
+	if (tlen > sizeof(tbuf) - 4096) {
+		log_flush();
 	}
-	close(fd);
+	va_start(ap, fmt);
+	int n = vsnprintf(tbuf + tlen, sizeof(tbuf) - tlen - 1, fmt, ap);
+	va_end(ap);
+	if (n > 0) {
+		tlen += (unsigned)n < sizeof(tbuf) - tlen - 1 ? (unsigned)n : (unsigned)(sizeof(tbuf) - tlen - 1);
+	}
 }
 
 static unsigned int
@@ -284,35 +288,6 @@ list_dir(const char *path)
 }
 
 static void
-history_load(void)
-{
-	int fd = open(HISTORY_PATH, O_RDONLY);
-	if (fd < 0) {
-		return;
-	}
-	struct stat st;
-	if (!fstat(fd, &st) && st.st_size > 0) {
-		off_t start = st.st_size > HISTORY_MAX ? st.st_size - HISTORY_MAX : 0;
-		ssize_t r = pread(fd, logbuf, (size_t)(st.st_size - start), start);
-		if (r > 0) {
-			loglen = (unsigned)r;
-		}
-	}
-	close(fd);
-}
-
-static void
-history_save(void)
-{
-	unsigned int start = loglen > HISTORY_MAX ? loglen - HISTORY_MAX : 0;
-	int fd = open(HISTORY_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-	if (fd >= 0) {
-		(void)write(fd, logbuf + start, loglen - start);
-		close(fd);
-	}
-}
-
-static void
 collect_file(const char *path, unsigned int max)
 {
 	struct stat st;
@@ -326,19 +301,26 @@ collect_file(const char *path, unsigned int max)
 	}
 	off_t start = st.st_size > (off_t)max ? st.st_size - (off_t)max : 0;
 	size_t n = (size_t)(st.st_size - start);
-	if (loglen + n + 1024 >= LOG_MAX) {
+	if (logpos + tlen + n + 4096 >= LOG_MAX) {
 		logf_("=== %s (%lld bytes): no room ===\n", path, (long long)st.st_size);
 		close(fd);
 		return;
 	}
 	/* exactly n bytes follow the header (zero padded on a short read), so binary files can be cut out */
 	logf_("=== %s (%lld bytes, %zu from %lld) ===\n", path, (long long)st.st_size, n, (long long)start);
-	ssize_t r = pread(fd, logbuf + loglen, n, start);
-	if (r < 0) {
-		r = 0;
+	log_flush();
+	for (size_t done = 0; done < n;) {
+		size_t c = n - done < sizeof(tbuf) ? n - done : sizeof(tbuf);
+		ssize_t r = pread(fd, tbuf, c, start + (off_t)done);
+		if (r < 0) {
+			r = 0;
+		}
+		memset(tbuf + r, 0, c - (size_t)r);
+		(void)pwrite(logfd, tbuf, c, LOG_OFF + 12 + (off_t)(logpos + done));
+		done += c;
 	}
-	memset(logbuf + loglen + r, 0, n - (size_t)r);
-	loglen += (unsigned)n;
+	logpos += n;
+	log_header();
 	logf_("\n");
 	close(fd);
 }
@@ -357,20 +339,33 @@ collect_all(int round)
 			collect_file(collect[i].path, collect[i].max);
 			continue;
 		}
+		/* names in descending order: for numbered logs (tracev3) the newest come first */
+		static char names[256][256];
+		int nn = 0;
 		DIR *d = opendir(collect[i].path);
 		if (!d) {
 			continue;
 		}
 		struct dirent *e;
-		while ((e = readdir(d))) {
-			if (e->d_name[0] == '.') {
-				continue;
+		while ((e = readdir(d)) && nn < 256) {
+			if (e->d_name[0] != '.') {
+				strlcpy(names[nn++], e->d_name, sizeof(names[0]));
 			}
-			char sub[1024];
-			snprintf(sub, sizeof(sub), "%s/%s", collect[i].path, e->d_name);
-			collect_file(sub, collect[i].max);
 		}
 		closedir(d);
+		for (int x = 1; x < nn; x++) {
+			for (int y = x; y > 0 && strcmp(names[y - 1], names[y]) < 0; y--) {
+				char t[256];
+				memcpy(t, names[y], sizeof(t));
+				memcpy(names[y], names[y - 1], sizeof(t));
+				memcpy(names[y - 1], t, sizeof(t));
+			}
+		}
+		for (int x = 0; x < nn; x++) {
+			char sub[1024];
+			snprintf(sub, sizeof(sub), "%s/%s", collect[i].path, names[x]);
+			collect_file(sub, collect[i].max);
+		}
 	}
 }
 
@@ -483,15 +478,12 @@ kill_ops(const unsigned char *pl, unsigned int len, unsigned int count)
 int
 main(void)
 {
-	logbuf = malloc(LOG_MAX);
-	if (!logbuf) {
-		return 1;
-	}
-	history_load();
+	logfd = open(DEV, O_WRONLY);
 	logf_("\n######## boot: a5update pid %d, time %ld ########\n", getpid(), (long)time(NULL));
 	int fd = open(DEV, O_RDONLY);
 	if (fd < 0) {
 		logf_("open %s: %s\n", DEV, strerror(errno));
+		log_flush();
 		return 1;
 	}
 	struct hdr h;
@@ -551,12 +543,14 @@ main(void)
 		list_dir(lists[i]);
 	}
 	log_flush();
+	logbase = logpos;
+	/* each round replaces the previous one, so the log ends with the latest copy of everything */
 	static const unsigned int waits[3] = { 30, 90, 180 };
 	for (int r = 0; r < 3 && ncollect; r++) {
 		sleep(waits[r]);
+		logpos = logbase;
 		collect_all(r + 1);
 		log_flush();
 	}
-	history_save();
 	return 0;
 }
