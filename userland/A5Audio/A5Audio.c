@@ -131,7 +131,10 @@ trace_prop(const char *what, AudioObjectID o, const AudioObjectPropertyAddress *
 	trace("%s obj %u '%s' scope '%s' elem %u -> %d\n", what, o, fcc(a->mSelector, s1), fcc(a->mScope, s2), a->mElement, (int)st);
 	os_unfair_lock_unlock(&gTraceLock);
 }
+
+#include "spy.h"
 static int gBeep = 1;
+static int gSpy;
 
 static void
 read_conf(void)
@@ -155,6 +158,8 @@ read_conf(void)
 					strlcpy(dst, eq + 1, 128);
 				} else if (!strcmp(l, "beep")) {
 					gBeep = eq[1] != '0';
+				} else if (!strcmp(l, "spy")) {
+					gSpy = eq[1] == '1';
 				} else if (!strcmp(l, "custom")) {
 					gDeclareCustom = eq[1] == '1';
 				}
@@ -335,6 +340,9 @@ A5_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHo
 	Float64 hostHz = 1e9 * (Float64)tb.denom / (Float64)tb.numer;
 	gHostTicksPerFrame = hostHz / kSampleRate;
 	read_conf();
+	if (gSpy) {
+		spy_install();
+	}
 	trace("--- A5Audio Initialize (pid %d)\n", getpid());
 	if (gBeep) {
 		pthread_t th;

@@ -1,0 +1,10 @@
+# Experiment 10: VirtualAudio still drops the Codec with 'who?', from a request that never reaches
+# A5Audio. A5Audio (spy=1) now wraps VirtualAudio's CoreAudio calls and logs every request and
+# result to /private/var/mobile/Library/Logs/a5/vaspy.log.
+FILE    ../../userland/A5Audio/out/A5Audio.driver/A5Audio /System/Library/Audio/Plug-Ins/HAL/A5Audio.driver/A5Audio 0755 0 0
+FILE    a5audio.conf /private/var/db/a5audio.conf 0644 0 0
+REMOVE  /private/var/mobile/Library/Logs/a5/a5audio.log
+KILL    mediaserverd
+COLLECT /private/var/mobile/Library/Logs/a5 4096
+COLLECT /private/var/db/diagnostics/timesync 2048
+COLLECT /private/var/db/diagnostics/Persist 12288
