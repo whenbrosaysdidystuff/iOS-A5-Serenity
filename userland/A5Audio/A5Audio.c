@@ -41,7 +41,7 @@
 
 #define kDevice_UID             "A5AudioSpeaker_UID"
 #define kDevice_ModelUID        "A5AudioSpeaker_ModelUID"
-#define kSampleRate             48000.0
+#define kSampleRate             48000.0         /* the kernel device's rate */
 #define kChannels               2
 #define RING_FRAMES             16384u
 #define kLatencyFrames          480u
@@ -51,7 +51,9 @@ static AudioServerPlugInHostRef gHost;
 static _Atomic UInt32 gRefCount = 1;
 static UInt32 gIOCount;
 static int gFd = -1;
-static Float64 gHostTicksPerFrame;
+static Float64 gHostTicksPerFrame, gHostHz;
+/* the HAL-facing rate: 48000 or 44100 (VirtualAudio runs at 44.1 kHz); 44.1 kHz is resampled */
+static Float64 gRate = kSampleRate, gPendingRate = kSampleRate;
 static UInt64 gAnchorHostTime;
 static UInt64 gNumberTimeStamps;
 static Float32 gVolume = 1.0f;          /* reserved for a volume control */
@@ -283,14 +285,48 @@ writer_thread(void *arg)
 			usleep(100000);
 			continue;
 		}
-		UInt32 n = wr - rd, off = rd % RING_U_FRAMES;
-		if (n > RING_U_FRAMES - off) {
-			n = RING_U_FRAMES - off;
+		UInt32 n = wr - rd;
+		if (gRate == kSampleRate) {
+			UInt32 off = rd % RING_U_FRAMES;
+			if (n > RING_U_FRAMES - off) {
+				n = RING_U_FRAMES - off;
+			}
+			ssize_t w = write(gFd, &gRing[off * kChannels], n * kChannels * sizeof(int16_t));
+			if (w > 0) {
+				atomic_store_explicit(&gRingRd, rd + (UInt32)w / (kChannels * sizeof(int16_t)), memory_order_release);
+			} else {
+				close_dev();
+				usleep(10000);
+			}
+			continue;
 		}
-		ssize_t w = write(gFd, &gRing[off * kChannels], n * kChannels * sizeof(int16_t));
-		if (w > 0) {
-			atomic_store_explicit(&gRingRd, rd + (UInt32)w / (kChannels * sizeof(int16_t)), memory_order_release);
-		} else {
+		/* linear-interpolation resampler gRate -> 48 kHz; pos is the fractional read position */
+		static int16_t out[4096 * kChannels];
+		static double pos;
+		double step = gRate / kSampleRate;
+		UInt32 o = 0;
+		while (o < 4096) {
+			UInt32 i = (UInt32)pos;
+			if (i + 1 >= n) {
+				break;
+			}
+			double f = pos - i;
+			for (UInt32 c = 0; c < kChannels; c++) {
+				int32_t s0 = gRing[((rd + i) % RING_U_FRAMES) * kChannels + c];
+				int32_t s1 = gRing[((rd + i + 1) % RING_U_FRAMES) * kChannels + c];
+				out[o * kChannels + c] = (int16_t)(s0 + (s1 - s0) * f);
+			}
+			o++;
+			pos += step;
+		}
+		UInt32 used = (UInt32)pos;
+		pos -= used;
+		atomic_store_explicit(&gRingRd, rd + used, memory_order_release);
+		if (o == 0) {
+			usleep(1000);
+			continue;
+		}
+		if (write(gFd, out, o * kChannels * sizeof(int16_t)) <= 0) {
 			close_dev();
 			usleep(10000);
 		}
@@ -331,7 +367,7 @@ static void
 fill_asbd(AudioStreamBasicDescription *d, Boolean integer)
 {
 	memset(d, 0, sizeof(*d));
-	d->mSampleRate = kSampleRate;
+	d->mSampleRate = gRate;
 	d->mFormatID = kAudioFormatLinearPCM;
 	d->mChannelsPerFrame = kChannels;
 	d->mFramesPerPacket = 1;
@@ -445,8 +481,8 @@ A5_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHo
 	gHost = inHost;
 	mach_timebase_info_data_t tb;
 	mach_timebase_info(&tb);
-	Float64 hostHz = 1e9 * (Float64)tb.denom / (Float64)tb.numer;
-	gHostTicksPerFrame = hostHz / kSampleRate;
+	gHostHz = 1e9 * (Float64)tb.denom / (Float64)tb.numer;
+	gHostTicksPerFrame = gHostHz / gRate;
 	read_conf();
 	if (gSpy || gRedirectConf) {
 		gRedirect = gRedirectConf;
@@ -486,7 +522,33 @@ A5_AddDeviceClient(AudioServerPlugInDriverRef d, AudioObjectID o, const AudioSer
 	return 0;
 }
 static OSStatus A5_RemoveDeviceClient(AudioServerPlugInDriverRef d, AudioObjectID o, const AudioServerPlugInClientInfo *c) { (void)d; (void)o; (void)c; return 0; }
-static OSStatus A5_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef d, AudioObjectID o, UInt64 a, void *i) { (void)d; (void)o; (void)a; (void)i; return 0; }
+static OSStatus
+request_rate(Float64 r)
+{
+	if (r != 44100.0 && r != 48000.0) {
+		return kAudioDeviceUnsupportedFormatError;
+	}
+	if (r == gRate) {
+		return 0;
+	}
+	gPendingRate = r;
+	trace("rate change requested: %d -> %d\n", (int)gRate, (int)r);
+	return gHost->RequestDeviceConfigurationChange(gHost, kObjectID_Device, 1, NULL);
+}
+
+static OSStatus
+A5_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef d, AudioObjectID o, UInt64 a, void *i)
+{
+	(void)d; (void)o; (void)i;
+	if (a == 1) {
+		gRate = gPendingRate;
+		gHostTicksPerFrame = gHostHz / gRate;
+		gNumberTimeStamps = 0;
+		gAnchorHostTime = mach_absolute_time();
+		trace("rate now %d\n", (int)gRate);
+	}
+	return 0;
+}
 static OSStatus A5_AbortDeviceConfigurationChange(AudioServerPlugInDriverRef d, AudioObjectID o, UInt64 a, void *i) { (void)d; (void)o; (void)a; (void)i; return 0; }
 
 /* ---------------------------------------------------------------- properties */
@@ -587,7 +649,7 @@ A5_GetPropertyDataSize_(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pi
 		case kAudioDevicePropertyNominalSampleRate:
 			*out = sizeof(Float64); return 0;
 		case kAudioDevicePropertyAvailableNominalSampleRates:
-			*out = sizeof(AudioValueRange); return 0;
+			*out = 2 * sizeof(AudioValueRange); return 0;
 		case kAudioDevicePropertyPreferredChannelsForStereo:
 			*out = 2 * sizeof(UInt32); return 0;
 		case kAudioDevicePropertyPreferredChannelLayout:
@@ -666,7 +728,7 @@ A5_GetPropertyDataSize_(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pi
 			*out = sizeof(AudioStreamBasicDescription); return 0;
 		case kAudioStreamPropertyAvailableVirtualFormats:
 		case kAudioStreamPropertyAvailablePhysicalFormats:
-			*out = sizeof(AudioStreamRangedDescription); return 0;
+			*out = 2 * sizeof(AudioStreamRangedDescription); return 0;
 		}
 		break;
 	}
@@ -739,10 +801,11 @@ A5_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 		case kAudioDevicePropertySafetyOffset: *u = kSafetyOffset; return 0;
 		case kAudioDevicePropertyIsHidden: *u = 0; return 0;
 		case kAudioDevicePropertyZeroTimeStampPeriod: *u = RING_FRAMES; return 0;
-		case kAudioDevicePropertyNominalSampleRate: *(Float64 *)d = kSampleRate; return 0;
+		case kAudioDevicePropertyNominalSampleRate: *(Float64 *)d = gRate; return 0;
 		case kAudioDevicePropertyAvailableNominalSampleRates: {
 			AudioValueRange *r = d;
-			r->mMinimum = r->mMaximum = kSampleRate;
+			r[0].mMinimum = r[0].mMaximum = 44100.0;
+			r[1].mMinimum = r[1].mMaximum = 48000.0;
 			return 0;
 		}
 		case kAudioDevicePropertyPreferredChannelsForStereo: u[0] = 1; u[1] = 2; return 0;
@@ -834,8 +897,11 @@ A5_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 		case kAudioStreamPropertyAvailableVirtualFormats:
 		case kAudioStreamPropertyAvailablePhysicalFormats: {
 			AudioStreamRangedDescription *r = d;
-			fill_asbd(&r->mFormat, a->mSelector == kAudioStreamPropertyAvailablePhysicalFormats);
-			r->mSampleRateRange.mMinimum = r->mSampleRateRange.mMaximum = kSampleRate;
+			for (int i = 0; i < 2; i++) {
+				fill_asbd(&r[i].mFormat, a->mSelector == kAudioStreamPropertyAvailablePhysicalFormats);
+				r[i].mFormat.mSampleRate = i ? 48000.0 : 44100.0;
+				r[i].mSampleRateRange.mMinimum = r[i].mSampleRateRange.mMaximum = r[i].mFormat.mSampleRate;
+			}
 			return 0;
 		}
 		}
@@ -885,13 +951,16 @@ A5_SetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 	}
 	if (o == kObjectID_Device && a->mSelector == kAudioDevicePropertyNominalSampleRate) {
 		NEED(sizeof(Float64));
-		return *(const Float64 *)d == kSampleRate ? 0 : kAudioHardwareIllegalOperationError;
+		return request_rate(*(const Float64 *)d);
 	}
 	if ((o == kObjectID_Stream || o == kObjectID_StreamIn) && (a->mSelector == kAudioStreamPropertyVirtualFormat ||
 	    a->mSelector == kAudioStreamPropertyPhysicalFormat)) {
 		NEED(sizeof(AudioStreamBasicDescription));
 		const AudioStreamBasicDescription *f = d;
-		return f->mSampleRate == kSampleRate && f->mChannelsPerFrame == kChannels ? 0 : kAudioDeviceUnsupportedFormatError;
+		if (f->mChannelsPerFrame != kChannels) {
+			return kAudioDeviceUnsupportedFormatError;
+		}
+		return request_rate(f->mSampleRate);
 	}
 	trace_prop("set", o, a, kAudioHardwareUnknownPropertyError);
 	return kAudioHardwareUnknownPropertyError;

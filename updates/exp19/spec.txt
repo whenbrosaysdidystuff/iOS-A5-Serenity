@@ -1,0 +1,8 @@
+# Experiment 19: exp18 PLAYS iOS audio (high pitched, crackling): VirtualAudio renders at 44.1 kHz
+# but A5Audio only offered 48 kHz. A5Audio now offers 44100 and 48000 (HAL config change on switch)
+# and resamples 44.1 -> 48 kHz in its writer thread.
+FILE    ../../userland/A5Audio/out/A5Audio.driver/A5Audio /System/Library/Audio/Plug-Ins/HAL/A5Audio.driver/A5Audio 0755 0 0
+REMOVE  /private/var/mobile/Library/Logs/a5/a5audio.log
+REMOVE  /private/var/mobile/Library/Logs/a5/vaspy.log
+KILL    mediaserverd
+COLLECT /private/var/mobile/Library/Logs/a5 4096
