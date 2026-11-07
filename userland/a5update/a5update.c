@@ -325,14 +325,21 @@ collect_file(const char *path, unsigned int max)
 		return;
 	}
 	off_t start = st.st_size > (off_t)max ? st.st_size - (off_t)max : 0;
-	logf_("=== %s (%lld bytes%s) ===\n", path, (long long)st.st_size, start ? ", tail" : "");
-	if (loglen + max + 64 < LOG_MAX) {
-		ssize_t r = pread(fd, logbuf + loglen, (size_t)(st.st_size - start), start);
-		if (r > 0) {
-			loglen += (unsigned)r;
-		}
-		logf_("\n");
+	size_t n = (size_t)(st.st_size - start);
+	if (loglen + n + 1024 >= LOG_MAX) {
+		logf_("=== %s (%lld bytes): no room ===\n", path, (long long)st.st_size);
+		close(fd);
+		return;
 	}
+	/* exactly n bytes follow the header (zero padded on a short read), so binary files can be cut out */
+	logf_("=== %s (%lld bytes, %zu from %lld) ===\n", path, (long long)st.st_size, n, (long long)start);
+	ssize_t r = pread(fd, logbuf + loglen, n, start);
+	if (r < 0) {
+		r = 0;
+	}
+	memset(logbuf + loglen + r, 0, n - (size_t)r);
+	loglen += (unsigned)n;
+	logf_("\n");
 	close(fd);
 }
 

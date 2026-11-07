@@ -1,0 +1,17 @@
+# Experiment 4: get VirtualAudio's own log messages. Turn on debug logging (kept on disk) for the
+# com.apple.coreaudio subsystem, restart logd + mediaserverd, and collect the unified log store
+# (tracev3 + timesync + VirtualAudio's uuidtext) as exact binary copies. The new a5update (exact
+# byte counts in the log) takes over from the next boot, so collect on the boot after applying.
+FILE    ../../userland/a5update/out/a5update /usr/libexec/a5update 0755 0 0
+FILE    com.apple.coreaudio.plist /Library/Preferences/Logging/Subsystems/com.apple.coreaudio.plist 0644 0 0
+KILL    logd
+KILL    mediaserverd
+LIST    /private/var/db/diagnostics
+LIST    /private/var/db/diagnostics/Persist
+LIST    /private/var/db/diagnostics/Special
+LIST    /private/var/db/uuidtext/31
+COLLECT /private/var/mobile/Library/Logs/a5 2048
+COLLECT /private/var/db/diagnostics/timesync 2048
+COLLECT /private/var/db/uuidtext/31/96333F5A48373BB4270146DC1177FB 4096
+COLLECT /private/var/db/diagnostics/Persist 12288
+COLLECT /private/var/db/diagnostics/Special 8192
