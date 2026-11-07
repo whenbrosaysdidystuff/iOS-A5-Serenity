@@ -1,0 +1,158 @@
+diff --git a/bsd/dev/sweet_a5_keys.c b/bsd/dev/sweet_a5_keys.c
+index 31e5b32..525cc67 100644
+--- a/bsd/dev/sweet_a5_keys.c
++++ b/bsd/dev/sweet_a5_keys.c
+@@ -34,6 +34,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <kern/locks.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+@@ -87,9 +88,13 @@ wr32(vm_offset_t a, uint32_t v)
+ 	*(volatile uint32_t *)a = v;
+ }
+ 
++/* the keys thread and the battery poll share the ADI read registers */
++static LCK_GRP_DECLARE(a5_adi_grp, "sweet_a5_adi");
++static LCK_MTX_DECLARE(a5_adi_lock, &a5_adi_grp);
++
+ /* 0 ok; 1 timeout; 2 the echoed address did not match */
+ static int
+-adi_read(uint32_t reg, uint32_t *val)
++adi_read_locked(uint32_t reg, uint32_t *val)
+ {
+ 	uint32_t pa = ADI_PA + ADI_SLAVE_OFF + reg;
+ 	wr32(adi + ADI_RD_CMD, pa);
+@@ -103,8 +108,29 @@ adi_read(uint32_t reg, uint32_t *val)
+ 	return 1;
+ }
+ 
++static int
++adi_read(uint32_t reg, uint32_t *val)
++{
++	lck_mtx_lock(&a5_adi_lock);
++	int rc = adi_read_locked(reg, val);
++	lck_mtx_unlock(&a5_adi_lock);
++	return rc;
++}
++
++static int
++adi_write_locked(uint32_t reg, uint32_t v);
++
+ static int
+ adi_write(uint32_t reg, uint32_t v)
++{
++	lck_mtx_lock(&a5_adi_lock);
++	int rc = adi_write_locked(reg, v);
++	lck_mtx_unlock(&a5_adi_lock);
++	return rc;
++}
++
++static int
++adi_write_locked(uint32_t reg, uint32_t v)
+ {
+ 	int i;
+ 	for (i = 0; i < 100000 && (rd32(adi + ADI_FIFO_STS) & FIFO_FULL); i++) {
+@@ -168,6 +194,35 @@ keys_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ }
+ 
++/*
++ * Battery for SweetBattery (sweetbattery=2): SC2730 fuel gauge (PMIC 0xc00, Linux
++ * sc27xx_fuel_gauge.c), read-only. VOLTAGE 0xc20, CURRENT 0xc2c (0x2000 = 0 mA); nominal
++ * scale ~683 ADC/V (no eFuse calibration yet), current 4x that per A (probe V16 on the
++ * phone: +88 mA charging / -33 mA idle at ~4.1 V). Positive mA = charging.
++ */
++#define FGU_EN_REG      0x1808u
++#define FGU_VOLTAGE     0xc20u
++#define FGU_CURRENT     0xc2cu
++#define FGU_ADC_1V      683
++
++int sweet_a5_battery(unsigned *mv, int *ma);
++
++int
++sweet_a5_battery(unsigned *mv, int *ma)
++{
++	uint32_t en = 0, v = 0, c = 0;
++	if (adi == 0) {
++		return -1;
++	}
++	if (adi_read(FGU_EN_REG, &en) || !(en & (1u << 7)) ||
++	    adi_read(FGU_VOLTAGE, &v) || adi_read(FGU_CURRENT, &c)) {
++		return -1;
++	}
++	*mv = v * 1000u / FGU_ADC_1V;
++	*ma = ((int)c - 0x2000) * 1000 / (4 * FGU_ADC_1V);
++	return 0;
++}
++
+ static int
+ rtc_read(uint64_t *secs)
+ {
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 9969739..bb48068 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -15,6 +15,8 @@
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* bsd/dev/sweet_a5_keys.c: Redmi A5 SC2730 fuel gauge (sweetbattery=2) */
++extern "C" int sweet_a5_battery(unsigned *mv, int *ma);
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -26,7 +28,7 @@ public:
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal;
++	bool fTimerAdded, fRunning, fReal, fA5;
+ 	int fLastMode;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+@@ -51,7 +53,7 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = false;
++	fTimerAdded = fRunning = fReal = fA5 = false;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -206,6 +208,23 @@ SweetBattery::estimatePercent(unsigned mv)
+ void
+ SweetBattery::poll(void)
+ {
++	if (fA5) {
++		/* Redmi A5: fuel gauge voltage + current; the charger IC charges on its own */
++		unsigned amv = 0;
++		int ama = 0;
++		bool ok = sweet_a5_battery(&amv, &ama) == 0 && amv >= 2800 && amv <= 4600;
++		if (!ok) {
++			publish(100, 4200, 0, true, true, false, true, false, false);
++			return;
++		}
++		bool charging = ama > 10;
++		/* charging raises the terminal voltage: estimate the resting voltage (~150 mOhm) */
++		int rest = (int)amv - ama * 150 / 1000;
++		unsigned pct = estimatePercent(rest > 0 ? (unsigned)rest : 0);
++		bool full = charging ? false : (pct >= 99 && ama > -5);
++		publish(pct, amv, ama, charging, charging, charging, full, true, true);
++		return;
++	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+@@ -264,7 +283,8 @@ SweetBattery::start(IOService *provider)
+ 	}
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_spmi_init() == 0;
++	fA5 = real == 2;
++	fReal = fA5 || (real == 1 && sweet_spmi_init() == 0);
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
