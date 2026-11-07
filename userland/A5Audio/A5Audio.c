@@ -10,6 +10,9 @@
  *
  * Installed as /System/Library/Audio/Plug-Ins/HAL/A5Audio.driver (tools/sweet-root-tweaks.py).
  * When mediaserverd loads it, a short 660 Hz beep is played (proof the plug-in is alive).
+ *
+ * /private/var/db/a5audio.conf (optional, written by a5update) overrides the device identity for
+ * VirtualAudio experiments, one "key=value" per line: uid=, name=, model=, beep=0.
  */
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <mach/mach_time.h>
@@ -38,6 +41,40 @@ static Float64 gHostTicksPerFrame;
 static UInt64 gAnchorHostTime;
 static UInt64 gNumberTimeStamps;
 static Float32 gVolume = 1.0f;          /* reserved for a volume control */
+static CFStringRef gUID, gName, gModel;
+static int gBeep = 1;
+
+static void
+read_conf(void)
+{
+	char buf[1024], uid[128] = kDevice_UID, name[128] = "Speaker", model[128] = kDevice_ModelUID;
+	int fd = open("/private/var/db/a5audio.conf", O_RDONLY);
+	if (fd >= 0) {
+		ssize_t n = read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		buf[n > 0 ? n : 0] = 0;
+		for (char *l = buf; l && *l;) {
+			char *nl = strchr(l, '\n');
+			if (nl) {
+				*nl = 0;
+			}
+			char *eq = strchr(l, '=');
+			if (eq) {
+				*eq = 0;
+				char *dst = !strcmp(l, "uid") ? uid : !strcmp(l, "name") ? name : !strcmp(l, "model") ? model : NULL;
+				if (dst) {
+					strlcpy(dst, eq + 1, 128);
+				} else if (!strcmp(l, "beep")) {
+					gBeep = eq[1] != '0';
+				}
+			}
+			l = nl ? nl + 1 : NULL;
+		}
+	}
+	gUID = CFStringCreateWithCString(NULL, uid, kCFStringEncodingUTF8);
+	gName = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
+	gModel = CFStringCreateWithCString(NULL, model, kCFStringEncodingUTF8);
+}
 
 /* ---------------------------------------------------------------- helpers */
 static void
@@ -199,7 +236,10 @@ A5_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHo
 	mach_timebase_info(&tb);
 	Float64 hostHz = 1e9 * (Float64)tb.denom / (Float64)tb.numer;
 	gHostTicksPerFrame = hostHz / kSampleRate;
-	hello_beep();
+	read_conf();
+	if (gBeep) {
+		hello_beep();
+	}
 	return 0;
 }
 
@@ -354,7 +394,7 @@ A5_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 		case kAudioPlugInPropertyDeviceList: *u = kObjectID_Device; return 0;
 		case kAudioPlugInPropertyTranslateUIDToDevice: {
 			CFStringRef uid = (qs == sizeof(CFStringRef) && q) ? *(const CFStringRef *)q : NULL;
-			*u = (uid && CFEqual(uid, CFSTR(kDevice_UID))) ? kObjectID_Device : kAudioObjectUnknown;
+			*u = (uid && CFEqual(uid, gUID)) ? kObjectID_Device : kAudioObjectUnknown;
 			return 0;
 		}
 		}
@@ -364,10 +404,10 @@ A5_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 		case kAudioObjectPropertyBaseClass: *u = kAudioObjectClassID; return 0;
 		case kAudioObjectPropertyClass: *u = kAudioDeviceClassID; return 0;
 		case kAudioObjectPropertyOwner: *u = kObjectID_PlugIn; return 0;
-		case kAudioObjectPropertyName: *(CFStringRef *)d = CFSTR("Speaker"); return 0;
+		case kAudioObjectPropertyName: *(CFStringRef *)d = CFRetain(gName); return 0;
 		case kAudioObjectPropertyManufacturer: *(CFStringRef *)d = CFSTR("A5 port"); return 0;
-		case kAudioDevicePropertyDeviceUID: *(CFStringRef *)d = CFSTR(kDevice_UID); return 0;
-		case kAudioDevicePropertyModelUID: *(CFStringRef *)d = CFSTR(kDevice_ModelUID); return 0;
+		case kAudioDevicePropertyDeviceUID: *(CFStringRef *)d = CFRetain(gUID); return 0;
+		case kAudioDevicePropertyModelUID: *(CFStringRef *)d = CFRetain(gModel); return 0;
 		case kAudioObjectPropertyOwnedObjects:
 		case kAudioDevicePropertyStreams: *u = kObjectID_Stream; return 0;
 		case kAudioDevicePropertyRelatedDevices: *u = kObjectID_Device; return 0;
