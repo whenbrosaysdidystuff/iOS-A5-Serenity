@@ -1,5 +1,5 @@
 /*
- * v20 BEEP (run 2: MCDT clock RMW, scene start before touching MCDT): plays a 1 kHz tone on the speaker. Path (after Otto Pflueger's mainline UMS9230 drivers:
+ * v20 BEEP (run 3: built with -mstrict-align; run 2 hit an alignment fault in sp32 with the MMU off): plays a 1 kHz tone on the speaker. Path (after Otto Pflueger's mainline UMS9230 drivers:
  * sprd-agdsp.c, vbc-v4-dsp.c, sprd-mcdt.c, ums9230-digital.c, codecs/sc2730.c, reeder-s19mps.dts):
  *   AP writes S16 stereo frames (one 32-bit word each) into MCDT DAC channel 4 (0x56490000+0x10)
  *   -> DSP FE "FAST_PLAYBACK" (id 3) -> VBC TX0 -> IIS0 (24 bit, frame inverted) -> digital codec
@@ -343,7 +343,7 @@ static int kctl(uint32_t ctl, uint32_t id, uint32_t val)
 }
 
 /* ---- DSP startup parameters (packed, 618 bytes; field order of vbc-v4-dsp.h) */
-static uint8_t sp[640];
+static uint8_t sp[640] __attribute__((aligned(16)));
 static uint32_t spo;
 static void sp32(uint32_t v) { for (int b = 0; b < 4; b++) sp[spo++] = (uint8_t)(v >> (8 * b)); }
 static void sppair(int n, const uint32_t *vals) { for (int i = 0; i < n; i++) { sp32(i); sp32(vals ? vals[i] : 0); } }
