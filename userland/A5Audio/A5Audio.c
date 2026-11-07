@@ -29,6 +29,10 @@
 #define kObjectID_Device        2
 #define kObjectID_Stream        3
 #define kObjectID_StreamIn      4       /* silent input: VirtualAudio requires the Codec to have one */
+/* macOS-only names in the SDK headers (same values on iOS) */
+#define kAudioDevicePropertyDataSource                  'ssrc'
+#define kAudioDevicePropertyDataSources                 'ssc#'
+#define kAudioDevicePropertyDataSourceNameForIDCFString 'lscn'
 
 #define kDevice_UID             "A5AudioSpeaker_UID"
 #define kDevice_ModelUID        "A5AudioSpeaker_ModelUID"
@@ -57,6 +61,10 @@ static UInt32 gExtraVal[4];
 /* exp8: declaring them made VirtualAudio read them through the HAL, which then failed with 'nope'
  * (the HAL only hands custom properties out as CF objects); "custom=1" in a5audio.conf turns it on */
 static int gDeclareCustom;
+
+/* data sources: VirtualAudio's codec needs input data sources (kAudioDevicePropertyDataSources
+ * 'ssc#' on the input scope) to build its microphone sub-ports. One built-in mic, 'imic'. */
+static UInt32 gInSource = 'imic';
 
 static int
 extra_index(UInt32 sel)
@@ -475,6 +483,15 @@ A5_GetPropertyDataSize_(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pi
 			*out = sizeof(CFPropertyListRef);
 			return 0;
 		}
+		if (a->mScope == kAudioObjectPropertyScopeInput && (a->mSelector == kAudioDevicePropertyDataSources ||
+		    a->mSelector == kAudioDevicePropertyDataSource)) {
+			*out = sizeof(UInt32);
+			return 0;
+		}
+		if (a->mScope == kAudioObjectPropertyScopeInput && a->mSelector == kAudioDevicePropertyDataSourceNameForIDCFString) {
+			*out = sizeof(AudioValueTranslation);
+			return 0;
+		}
 		if (a->mSelector == kAudioObjectPropertyCustomPropertyInfoList && gDeclareCustom) {
 			*out = 4 * sizeof(AudioServerPlugInCustomPropertyInfo);
 			return 0;
@@ -594,6 +611,23 @@ A5_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 			*(CFPropertyListRef *)d = CFNumberCreate(NULL, kCFNumberSInt32Type, &v);
 			return 0;
 		}
+		if (a->mSelector == kAudioDevicePropertyDataSources) {
+			*u = 'imic';
+			return 0;
+		}
+		if (a->mSelector == kAudioDevicePropertyDataSource) {
+			*u = gInSource;
+			return 0;
+		}
+		if (a->mSelector == kAudioDevicePropertyDataSourceNameForIDCFString) {
+			AudioValueTranslation *t = d;
+			if (t->mOutputDataSize < sizeof(CFStringRef) || !t->mOutputData) {
+				return kAudioHardwareBadPropertySizeError;
+			}
+			*(CFStringRef *)t->mOutputData = CFSTR("Microphone");
+			t->mOutputDataSize = sizeof(CFStringRef);
+			return 0;
+		}
 		if (a->mSelector == kAudioObjectPropertyCustomPropertyInfoList) {
 			AudioServerPlugInCustomPropertyInfo *ci = d;
 			for (int i = 0; i < 4; i++) {
@@ -642,6 +676,11 @@ A5_SetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID o, pid_t p
 	(void)pid; (void)qs; (void)q;
 	if (inDriver != gDriverRef) {
 		return kAudioHardwareBadObjectError;
+	}
+	if (o == kObjectID_Device && a->mSelector == kAudioDevicePropertyDataSource) {
+		NEED(sizeof(UInt32));
+		trace_prop("set-ok", o, a, 0);
+		return *(const UInt32 *)d == 'imic' ? 0 : kAudioHardwareIllegalOperationError;
 	}
 	if (o == kObjectID_Device && extra_index(a->mSelector) >= 0) {
 		NEED(sizeof(CFPropertyListRef));

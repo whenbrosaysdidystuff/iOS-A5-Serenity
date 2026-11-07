@@ -1,0 +1,10 @@
+# Experiment 11: the spy showed VirtualAudio's last request before dropping the Codec is
+# HasProperty('ssc#' input) = kAudioDevicePropertyDataSources -> false; it then throws 'who?' itself.
+# A5Audio now has one input data source ('imic', "Microphone"). Spy stays on (a5audio.conf from exp10).
+FILE    ../../userland/A5Audio/out/A5Audio.driver/A5Audio /System/Library/Audio/Plug-Ins/HAL/A5Audio.driver/A5Audio 0755 0 0
+REMOVE  /private/var/mobile/Library/Logs/a5/a5audio.log
+REMOVE  /private/var/mobile/Library/Logs/a5/vaspy.log
+KILL    mediaserverd
+COLLECT /private/var/mobile/Library/Logs/a5 4096
+COLLECT /private/var/db/diagnostics/timesync 2048
+COLLECT /private/var/db/diagnostics/Persist 12288
