@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--a5]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--a5 [--touch-fw FT8057.bin]]
 
 --a5: Redmi A5 (serenity, Unisoc UMS9230) instead of sweet. Values measured on the phone by the
 a5-ios-port probes (see a5-ios-port/HARDWARE-NOTES.md): GICv3 0x10000000/0x10040000, virtual
@@ -91,7 +91,7 @@ A5_TIMEBASE = 26000000
 A5_VTIMER_INTID = 27
 
 
-def build(seed=None, qemu=False, highmem=False, a5=False):
+def build(seed=None, qemu=False, highmem=False, a5=False, touch_fw=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     if a5:
@@ -237,6 +237,20 @@ def build(seed=None, qemu=False, highmem=False, a5=False):
         ('reg', u64(A5_EMMC, 0x1000)),
     ])
 
+    # bsd/dev/sweet_a5_touch.c (A5): FocalTech FT8057M firmware for the touch IC's RAM.
+    # Comes from the phone's own focaltech_ft8057_spi_ts.ko (--touch-fw FILE); never in git.
+    touch = []
+    if a5 and touch_fw:
+        fwb = open(touch_fw, 'rb').read()
+        pram = (fwb[0x100] << 8 | fwb[0x101]) * 2
+        dram = (fwb[0x108] << 8 | fwb[0x109]) * 2
+        assert (fwb[0x100] << 8 | fwb[0x101]) + (fwb[0x102] << 8 | fwb[0x103]) == 0xffff, 'not FocalTech firmware'
+        touch = [node('sweet-touch', [
+            ph(),
+            ('compatible', cstr('focaltech,ft8057')),
+            ('firmware', fwb[:pram + dram]),
+        ])]
+
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
     # No effaceable storage: keybagd then reads /private/var/keybags/systembag.kb
@@ -273,11 +287,12 @@ def build(seed=None, qemu=False, highmem=False, a5=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [emmc] if a5 else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [emmc] if a5 else [ufs]) + touch)
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, a5='--a5' in sys.argv)
+    tfw = sys.argv[sys.argv.index('--touch-fw') + 1] if '--touch-fw' in sys.argv else None
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, a5='--a5' in sys.argv, touch_fw=tfw)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

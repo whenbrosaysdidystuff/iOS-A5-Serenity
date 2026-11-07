@@ -1,0 +1,552 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index e3981c7..cd34080 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -107,6 +107,7 @@ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_emmc.c			standard
+ bsd/dev/sweet_a5_keys.c			standard
++bsd/dev/sweet_a5_touch.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/sweet_a5_touch.c b/bsd/dev/sweet_a5_touch.c
+new file mode 100644
+index 0000000..5bb8963
+--- /dev/null
++++ b/bsd/dev/sweet_a5_touch.c
+@@ -0,0 +1,444 @@
++/*
++ * Redmi A5 (serenity) touchscreen: FocalTech FT8057M (TDDI, panel ft8057_boe) on SPI3,
++ * as proven bare-metal by probe V15 (probes/v15-touch): boot ID 80 57, firmware to
++ * the touch IC's RAM with matching ECC, then touch packets from register 0x01.
++ *
++ *   SPI3 0x20150000 (Linux spi-sprd.c programming, PIO, mode 0, 6.5 MHz)
++ *   clock gate apapb 0x20000000 bit 8 (set register +0x1000), clock 0x20010058 = 26 MHz
++ *   reset GPIO 145, IRQ GPIO 144 (ap_gpio 0x641b0000 bank 9; IRQ not used: polled)
++ *
++ * The FT8057M has no flash: its firmware (60744 B PRAM + 4036 B DRAM for this panel)
++ * is loaded into its RAM at every start. It comes from the phone's own driver module and
++ * is passed in the ADT node /sweet-touch "firmware" (tools/mkadt.py --touch-fw), never
++ * built into the kernel. Only RAM commands are sent (0x55, 0x90, 0xAD/0xAE, 0xCC/0xCE/0xCD,
++ * 0x08, register reads): no flash erase/write command exists in this file.
++ *
++ * Points (panel pixels 0..719 x 0..1639) are mapped to the presented 1125x2436 canvas
++ * through SweetFramebuffer's scaling and go to SweetHIDTouch (sweet_hid_touch_canvas).
++ * Boot-arg a5touch=0 disables it.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_hid_touch_canvas(int finger, int down, int x, int y);
++extern bool sweet_fb_panel_to_canvas(uint32_t px, uint32_t py, uint32_t *cx, uint32_t *cy);
++void sweet_a5_touch_init(void);
++
++#define APB_PA          0x20000000u
++#define APB_EB_SET      0x1000u
++#define APCLK_PA        0x20010000u
++#define APCLK_SPI3      0x58u
++#define SPI_PA          0x20150000u
++#define GPIO_PA         0x641b0000u
++#define GPIO_BANK9      (9u * 0x80u)
++#define TP_RST_BIT      2u              /* GPIO 145 */
++
++#define SPI_TXD         0x00
++#define SPI_CLKD        0x04
++#define SPI_CTL0        0x08
++#define SPI_CTL1        0x0c
++#define SPI_CTL3        0x14
++#define SPI_CTL5        0x1c
++#define SPI_INT_CLR     0x24
++#define SPI_INT_RAW     0x28
++#define SPI_CTL6        0x40
++#define SPI_FIFO_RST    0x48
++#define SPI_CTL7        0x4c
++#define SPI_CTL8        0x54
++#define SPI_CTL9        0x58
++#define SPI_CTL10       0x5c
++#define SPI_CTL11       0x60
++#define RX_END          (1u << 9)
++#define TX_END          (1u << 8)
++
++#define PANEL_W         720
++#define PANEL_H         1640
++#define MAX_POINTS      10
++#define PKT_LEN         84              /* FTS_TOUCH_DATA_LEN_V2 */
++#define WRITE_CHUNK     32752           /* FTS_FLASH_PACKET_LENGTH_SPI */
++
++static vm_offset_t spi, gpio9;
++static const uint8_t *fw;
++static uint32_t fw_len, pram_len, dram_len;
++static bool started;
++static int tp_chan;
++static uint8_t txb[WRITE_CHUNK + 16], rxb[WRITE_CHUNK + 16];
++
++static inline uint32_t rd32(vm_offset_t a) { return *(volatile uint32_t *)a; }
++static inline void wr32(vm_offset_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
++
++static void
++sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&tp_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++spi_setup(void)
++{
++	uint32_t v = rd32(spi + SPI_CTL0);
++	v &= ~((1u << 13) | 3u | (0x1fu << 2));
++	v |= (1u << 1) | (8u << 2) | (0xfu << 8);       /* mode 0, 8-bit, CS released */
++	wr32(spi + SPI_CTL0, v);
++	wr32(spi + SPI_CTL5, 9);
++	wr32(spi + SPI_FIFO_RST, 1);
++	delay(1);
++	wr32(spi + SPI_FIFO_RST, 0);
++	v = rd32(spi + SPI_CTL7);
++	v &= ~((7u << 3) | (1u << 15));                 /* 4-wire, one data line */
++	wr32(spi + SPI_CTL7, v);
++	wr32(spi + SPI_INT_CLR, 0x33f);
++	wr32(spi + SPI_CTL6, (2u << 8) | 8);
++	wr32(spi + SPI_CTL3, (2u << 8) | 8);
++	wr32(spi + SPI_CLKD, 1);                        /* 26 MHz / 4 = 6.5 MHz */
++	v = rd32(spi + SPI_CTL1);
++	v |= (3u << 12) | (3u << 14);                   /* RX + TX */
++	wr32(spi + SPI_CTL1, v);
++}
++
++static void
++cs(bool assert)
++{
++	uint32_t v = rd32(spi + SPI_CTL0);
++	v = assert ? (v & ~(1u << 8)) : (v | (0xfu << 8));
++	wr32(spi + SPI_CTL0, v);
++}
++
++static int
++spi_xfer(uint32_t len)
++{
++	cs(true);
++	delay(1);
++	for (uint32_t done = 0; done < len;) {
++		uint32_t n = MIN(len - done, 32u);
++		wr32(spi + SPI_CTL8, 0);
++		wr32(spi + SPI_CTL9, n);
++		wr32(spi + SPI_CTL10, 0);
++		wr32(spi + SPI_CTL11, n);
++		for (uint32_t i = 0; i < n; i++) {
++			*(volatile uint8_t *)(spi + SPI_TXD) = txb[done + i];
++		}
++		uint64_t start = mach_absolute_time(), lim;
++		nanoseconds_to_absolutetime(10 * NSEC_PER_MSEC, &lim);
++		while (!(rd32(spi + SPI_INT_RAW) & RX_END)) {
++			if (mach_absolute_time() - start > lim) {
++				cs(false);
++				return -1;
++			}
++		}
++		wr32(spi + SPI_INT_CLR, TX_END | RX_END);
++		for (uint32_t i = 0; i < n; i++) {
++			rxb[done + i] = *(volatile uint8_t *)(spi + SPI_TXD);
++		}
++		done += n;
++	}
++	delay(1);
++	cs(false);
++	delay(150);                                     /* CS_HIGH_DELAY */
++	return 0;
++}
++
++static uint16_t
++crc8408(const uint8_t *d, uint32_t n)
++{
++	uint16_t c = 0xffff;
++	for (uint32_t i = 0; i < n; i++) {
++		c ^= d[i];
++		for (int b = 0; b < 8; b++) {
++			c = (c & 1) ? (uint16_t)((c >> 1) ^ 0x8408) : (uint16_t)(c >> 1);
++		}
++	}
++	return c;
++}
++
++/* cmd + data (len bytes of data, may be 0) */
++static int
++fts_write(uint8_t cmd, const uint8_t *data, uint32_t len)
++{
++	uint32_t t = 0;
++	if (len > WRITE_CHUNK) {
++		return -1;
++	}
++	txb[t++] = cmd;
++	txb[t++] = 0x00;
++	txb[t++] = (uint8_t)(len >> 8);
++	txb[t++] = (uint8_t)len;
++	if (len) {
++		txb[t++] = 0;
++		txb[t++] = 0;
++		txb[t++] = 0;
++		memcpy(txb + t, data, len);
++		t += len;
++	}
++	for (int r = 0; r < 3; r++) {
++		if (spi_xfer(t) == 0 && !(rxb[3] & 0xa0)) {
++			return 0;
++		}
++		delay(150);
++	}
++	return -1;
++}
++
++static int
++fts_read(uint8_t cmd, uint8_t *out, uint32_t n)
++{
++	uint32_t t = 0, dp;
++	txb[t++] = cmd;
++	txb[t++] = 0xa0;
++	txb[t++] = (uint8_t)(n >> 8);
++	txb[t++] = (uint8_t)n;
++	txb[t++] = 0;
++	txb[t++] = 0;
++	txb[t++] = 0;
++	dp = t;
++	t += n + 2;
++	bzero(txb + dp, n + 2);
++	for (int r = 0; r < 3; r++) {
++		if (spi_xfer(t) == 0 && !(rxb[3] & 0xa0) &&
++		    crc8408(rxb + dp, n) == (uint16_t)(rxb[dp + n] | rxb[dp + n + 1] << 8)) {
++			memcpy(out, rxb + dp, n);
++			return 0;
++		}
++		delay(150);
++	}
++	return -1;
++}
++
++static void
++tp_reset(void)
++{
++	uint32_t d = rd32(gpio9);
++	wr32(gpio9, d & ~TP_RST_BIT);
++	sleep_ms(1);
++	wr32(gpio9, d | TP_RST_BIT);
++}
++
++static uint16_t
++ecc_host(const uint8_t *d, uint32_t n)
++{
++	uint16_t e = 0;
++	for (uint32_t i = 0; i + 1 < n; i += 2) {
++		e ^= (uint16_t)(d[i] << 8 | d[i + 1]);
++		for (int j = 0; j < 16; j++) {
++			e = (e & 1) ? (uint16_t)((e >> 1) ^ 0x8408) : (uint16_t)(e >> 1);
++		}
++	}
++	return e;
++}
++
++static int
++ram_write(uint32_t base, const uint8_t *d, uint32_t len)
++{
++	for (uint32_t off = 0; off < len; off += WRITE_CHUNK) {
++		uint32_t n = MIN(len - off, (uint32_t)WRITE_CHUNK), a = base + off;
++		uint8_t sa[3] = { (uint8_t)(a >> 16), (uint8_t)(a >> 8), (uint8_t)a };
++		if (fts_write(0xad, sa, 3) || fts_write(0xae, d + off, n)) {
++			return -1;
++		}
++	}
++	uint8_t c[6] = { (uint8_t)(base >> 16), (uint8_t)(base >> 8), (uint8_t)base,
++		         (uint8_t)(len >> 16), (uint8_t)(len >> 8), (uint8_t)len };
++	if (fts_write(0xcc, c, 6)) {
++		return -2;
++	}
++	sleep_ms(2);
++	uint8_t v[2] = { 0, 0 };
++	int i;
++	for (i = 0; i < 100; i++) {
++		if (fts_read(0xce, v, 1) == 0 && v[0] == 0xa5) {
++			break;
++		}
++		sleep_ms(1);
++	}
++	if (i == 100 || fts_read(0xcd, v, 2)) {
++		return -3;
++	}
++	uint16_t tp = (uint16_t)(v[0] << 8 | v[1]), host = ecc_host(d, len);
++	if (tp != host) {
++		printf("SWEET A5 TOUCH: ECC mismatch at 0x%x: ic %04x host %04x\n", base, tp, host);
++		return -4;
++	}
++	return 0;
++}
++
++/* reset into ROM boot, load the firmware into PRAM/DRAM, start it */
++static int
++load_firmware(void)
++{
++	uint8_t id[2] = { 0, 0 };
++	int i;
++	for (i = 0; i < 30; i++) {
++		tp_reset();
++		sleep_ms(8 + i);
++		if (fts_write(0x55, NULL, 0) == 0) {
++			sleep_ms(8);
++			if (fts_read(0x90, id, 2) == 0 && id[0] == 0x80 && (id[1] == 0x57 || id[1] == 0xc7)) {
++				break;
++			}
++		}
++	}
++	if (i == 30) {
++		printf("SWEET A5 TOUCH: no ROM boot answer (id %02x %02x)\n", id[0], id[1]);
++		return -1;
++	}
++	int r = ram_write(0, fw, pram_len);
++	if (!r && dram_len) {
++		r = ram_write(0xd00000, fw + pram_len, dram_len);
++	}
++	if (r) {
++		printf("SWEET A5 TOUCH: firmware download failed (%d)\n", r);
++		return -2;
++	}
++	(void)fts_write(0x08, NULL, 0);
++	sleep_ms(200);
++	uint8_t chip[2] = { 0, 0 }, ver = 0;
++	(void)fts_read(0xa3, &chip[0], 1);
++	(void)fts_read(0x9f, &chip[1], 1);
++	(void)fts_read(0xa6, &ver, 1);
++	printf("SWEET A5 TOUCH: boot id %02x %02x (try %d), firmware %u+%u bytes loaded, chip %02x%02x fw %02x\n",
++	    id[0], id[1], i, pram_len, dram_len, chip[0], chip[1], ver);
++	return 0;
++}
++
++/* panel point -> canvas point; outside the scaled canvas (the black bars) clamps to its edge */
++static void
++to_canvas(int x, int y, int *cx, int *cy)
++{
++	uint32_t ux, uy;
++	for (int step = 0; step < 80; step++) {
++		if (sweet_fb_panel_to_canvas((uint32_t)x, (uint32_t)y, &ux, &uy)) {
++			*cx = (int)ux;
++			*cy = (int)uy;
++			return;
++		}
++		/* move toward the panel centre until inside the canvas */
++		y += y < PANEL_H / 2 ? 1 : -1;
++		x += x < PANEL_W / 2 ? (step & 1) : -(step & 1);
++	}
++	*cx = x;
++	*cy = y;
++}
++
++static void
++touch_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	bool down[MAX_POINTS] = { false };
++	unsigned bad = 0;
++	uint64_t reads = 0;
++
++	for (int attempt = 0; attempt < 3 && load_firmware() != 0; attempt++) {
++		sleep_ms(500);
++	}
++	for (;;) {
++		uint8_t buf[PKT_LEN];
++		bool now_down[MAX_POINTS] = { false };
++		int px[MAX_POINTS] = { 0 }, py[MAX_POINTS] = { 0 };
++
++		if (fts_read(0x01, buf, sizeof(buf)) != 0 ||
++		    (buf[1] == 0xef && buf[2] == 0xef && buf[3] == 0xef) ||
++		    (buf[1] == 0xff && buf[2] == 0xff && buf[3] == 0xff && buf[4] == 0xff)) {
++			/* the touch IC restarted (ESD / panel reset) or the bus failed: reload */
++			if (++bad >= 50) {
++				printf("SWEET A5 TOUCH: no valid data after %llu reads, reloading firmware\n", reads);
++				for (int k = 0; k < MAX_POINTS; k++) {
++					if (down[k]) {
++						sweet_hid_touch_canvas(k, 0, 0, 0);
++						down[k] = false;
++					}
++				}
++				(void)load_firmware();
++				bad = 0;
++			}
++			sleep_ms(10);
++			continue;
++		}
++		bad = 0;
++		reads++;
++		if ((buf[1] >> 4) == 0) {               /* TOUCH_DEFAULT event */
++			for (int i = 0; i < MAX_POINTS; i++) {
++				const uint8_t *p = buf + 2 + 6 * i;
++				int id = p[2] >> 4, flag = p[0] >> 6;
++				if (id >= MAX_POINTS) {
++					break;
++				}
++				if (flag != 1) {                /* 0 down, 2 contact; 1 = up */
++					now_down[id] = true;
++					px[id] = ((p[0] & 0x0f) << 8) | p[1];
++					py[id] = ((p[2] & 0x0f) << 8) | p[3];
++				}
++			}
++		}
++		for (int k = 0; k < MAX_POINTS; k++) {
++			if (now_down[k]) {
++				int cx, cy;
++				to_canvas(px[k], py[k], &cx, &cy);
++				sweet_hid_touch_canvas(k, 1, cx, cy);
++				down[k] = true;
++			} else if (down[k]) {
++				sweet_hid_touch_canvas(k, 0, 0, 0);
++				down[k] = false;
++			}
++		}
++		sleep_ms(10);
++	}
++}
++
++void
++sweet_a5_touch_init(void)
++{
++	uint32_t on = 1;
++	DTEntry node;
++	const void *prop = NULL;
++	unsigned int size = 0;
++	thread_t thread;
++
++	if (started) {
++		return;
++	}
++	started = true;
++	PE_parse_boot_argn("a5touch", &on, sizeof(on));
++	if (!on) {
++		printf("SWEET A5 TOUCH: disabled (a5touch=0)\n");
++		return;
++	}
++	if (SecureDTLookupEntry(NULL, "/sweet-touch", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "firmware", &prop, &size) != kSuccess || size < 0x120) {
++		printf("SWEET A5 TOUCH: no firmware in the device tree (/sweet-touch firmware)\n");
++		return;
++	}
++	fw = prop;
++	fw_len = size;
++	uint32_t cl = (uint32_t)(fw[0x100] << 8 | fw[0x101]), cln = (uint32_t)(fw[0x102] << 8 | fw[0x103]);
++	uint32_t dl = (uint32_t)(fw[0x108] << 8 | fw[0x109]), dln = (uint32_t)(fw[0x10a] << 8 | fw[0x10b]);
++	pram_len = cl * 2;
++	dram_len = (dl + dln == 0xffff && dl) ? dl * 2 : 0;
++	if (cl + cln != 0xffff || pram_len < 0x120 || pram_len + dram_len > fw_len) {
++		printf("SWEET A5 TOUCH: bad firmware header (%x %x, %u bytes)\n", cl, cln, fw_len);
++		return;
++	}
++	vm_offset_t apb = ml_io_map(APB_PA, 0x2000), apclk = ml_io_map(APCLK_PA, 0x1000);
++	spi = ml_io_map(SPI_PA, 0x1000);
++	gpio9 = ml_io_map(GPIO_PA, 0x1000) + GPIO_BANK9;
++	wr32(apb + APB_EB_SET, 1u << 8);                /* spi3-eb */
++	wr32(apclk + APCLK_SPI3, 0);                    /* 26 MHz, /1 */
++	delay(10);
++	spi_setup();
++	if (kernel_thread_start(touch_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET A5 TOUCH: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index c86a2bc..e34bb59 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -58,6 +58,7 @@
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern void sweet_a5_keys_init(void);
++extern void sweet_a5_touch_init(void);
+ 
+ #define SD_BLKCNT32     0x00
+ #define SD_BLKSZ        0x04            /* + 16-bit count at 0x06: write both as one u32 */
+@@ -764,6 +765,7 @@ sweet_emmc_init(void)
+ 	    se.part, se.first, se.nsect >> 11, se.writable ? "read-write" : "read-only");
+ 	/* A5 input: the buttons (bsd/dev/sweet_a5_keys.c) start with the root device */
+ 	sweet_a5_keys_init();
++	sweet_a5_touch_init();
+ 	return 0;
+ }
+ 
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 27bc49d..6c9b472 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -360,7 +360,7 @@ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+-	void touch(int finger, bool down, int x, int y);
++	void touch(int finger, bool down, int x, int y, bool canvas = false);
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Digitizer; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Dig_TouchScreen; }
+@@ -449,8 +449,11 @@ SweetHIDTouch::start(IOService *provider)
+ }
+ 
+ void
+-SweetHIDTouch::touch(int finger, bool down, int x, int y)
++SweetHIDTouch::touch(int finger, bool down, int x, int y, bool canvas)
+ {
++	/* canvas: x, y are already in the presented 1125x2436 display (A5: scaled panel) */
++	int maxx = canvas ? (int)fLogicalW - 1 : 1079, maxy = canvas ? (int)fLogicalH - 1 : 2399;
++	int offx = canvas ? 0 : fOffX, offy = canvas ? 0 : fOffY;
+ 	uint64_t now = mach_absolute_time();
+ 	IOHIDEvent *collection;
+ 	bool any = false;
+@@ -458,22 +461,22 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
+ 		return;
+ 	}
+-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	x = x < 0 ? 0 : (x > maxx ? maxx : x);
++	y = y < 0 ? 0 : (y > maxy ? maxy : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+ 	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
+-	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+-	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	IOFixed nx = (IOFixed)(((int64_t)(x + offx) << 16) / fLogicalW);
++	IOFixed ny = (IOFixed)(((int64_t)(y + offy) << 16) / fLogicalH);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > maxx - SWEET_TOUCH_EDGE_PX ||
++		    y < SWEET_TOUCH_EDGE_PX || y > maxy - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
+@@ -559,3 +562,14 @@ sweet_hid_touch(int finger, int down, int x, int y)
+ 		gSweetTouch->touch(finger, down != 0, x, y);
+ 	}
+ }
++
++/* Touch in presented-display (canvas) pixels, 0..1124 x 0..2435 (Redmi A5 touch driver). */
++extern "C" void sweet_hid_touch_canvas(int finger, int down, int x, int y);
++
++extern "C" void
++sweet_hid_touch_canvas(int finger, int down, int x, int y)
++{
++	if (gSweetTouch) {
++		gSweetTouch->touch(finger, down != 0, x, y, true);
++	}
++}
