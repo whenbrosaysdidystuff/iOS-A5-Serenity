@@ -5,5 +5,5 @@ install-name: '/usr/lib/libSystem.B.dylib'
 current-version: 1319
 exports:
   - targets: [ arm64-ios ]
-    symbols: [ _bzero, _close, _mach_absolute_time, _mach_timebase_info, _open, _write, _read, _vsnprintf, _getpid, _os_unfair_lock_lock, _os_unfair_lock_unlock, _pthread_create, _pthread_detach, _usleep, _dlsym, _dladdr, _mprotect, _getpagesize, __dyld_register_func_for_add_image, _strstr, _strncmp, _snprintf, _strchr, _strcmp, _strlcpy, _memset, _memcpy, dyld_stub_binder ]
+    symbols: [ _bzero, _close, _mach_absolute_time, _mach_timebase_info, _open, _write, _read, _vsnprintf, _getpid, _os_unfair_lock_lock, _os_unfair_lock_unlock, _pthread_create, _pthread_detach, _usleep, _sleep, _notify_register_check, _notify_get_state, _notify_set_state, _notify_post, _notify_cancel, _dlsym, _dladdr, _mprotect, _getpagesize, __dyld_register_func_for_add_image, _strstr, _strncmp, _snprintf, _strchr, _strcmp, _strlcpy, _memset, _memcpy, dyld_stub_binder ]
 ...

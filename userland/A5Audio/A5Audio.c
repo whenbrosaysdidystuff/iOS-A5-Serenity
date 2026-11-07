@@ -24,6 +24,7 @@
 #include <stdarg.h>
 #include <os/lock.h>
 #include <pthread.h>
+#include <notify.h>
 
 #define kObjectID_PlugIn        kAudioObjectPlugInObject
 #define kObjectID_Device        2
@@ -163,6 +164,31 @@ trace_prop(const char *what, AudioObjectID o, const AudioObjectPropertyAddress *
 #include "spy.h"
 static int gBeep = 1;
 static int gSpy;
+static int gRinger = 1;
+
+/* The Redmi has no ring/silent switch, and iOS treats a missing one as "silent": VirtualAudio culls
+ * every system-sound route to the speaker ("ringer switch is off"). Publish the ringer as on
+ * (com.apple.springboard.ringerstate = 1) a few times after start, in case SpringBoard posts later.
+ * a5audio.conf "ringer=0" leaves it alone. */
+static void *
+ringer_thread(void *arg)
+{
+	static const unsigned delays[] = { 1, 5, 15, 30, 60, 120 };
+	(void)arg;
+	for (unsigned i = 0; i < sizeof(delays) / sizeof(delays[0]); i++) {
+		sleep(i ? delays[i] - delays[i - 1] : delays[0]);
+		int tok = 0;
+		uint64_t old = 99, now = 99;
+		uint32_t r1 = notify_register_check("com.apple.springboard.ringerstate", &tok);
+		notify_get_state(tok, &old);
+		uint32_t r2 = notify_set_state(tok, 1);
+		uint32_t r3 = notify_post("com.apple.springboard.ringerstate");
+		notify_get_state(tok, &now);
+		notify_cancel(tok);
+		trace("ringer: was %llu, set -> %u/%u/%u, now %llu\n", old, r1, r2, r3, now);
+	}
+	return NULL;
+}
 
 static void
 read_conf(void)
@@ -186,6 +212,8 @@ read_conf(void)
 					strlcpy(dst, eq + 1, 128);
 				} else if (!strcmp(l, "beep")) {
 					gBeep = eq[1] != '0';
+				} else if (!strcmp(l, "ringer")) {
+					gRinger = eq[1] != '0';
 				} else if (!strcmp(l, "spy")) {
 					gSpy = eq[1] == '1';
 				} else if (!strcmp(l, "custom")) {
@@ -370,6 +398,12 @@ A5_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHo
 	read_conf();
 	if (gSpy) {
 		spy_install();
+	}
+	if (gRinger) {
+		pthread_t rt;
+		if (pthread_create(&rt, NULL, ringer_thread, NULL) == 0) {
+			pthread_detach(rt);
+		}
 	}
 	trace("--- A5Audio Initialize (pid %d)\n", getpid());
 	if (gBeep) {
