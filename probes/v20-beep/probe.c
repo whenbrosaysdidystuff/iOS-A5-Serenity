@@ -1,5 +1,5 @@
 /*
- * v20 BEEP: plays a 1 kHz tone on the speaker. Path (after Otto Pflueger's mainline UMS9230 drivers:
+ * v20 BEEP (run 2: MCDT clock RMW, scene start before touching MCDT): plays a 1 kHz tone on the speaker. Path (after Otto Pflueger's mainline UMS9230 drivers:
  * sprd-agdsp.c, vbc-v4-dsp.c, sprd-mcdt.c, ums9230-digital.c, codecs/sc2730.c, reeder-s19mps.dts):
  *   AP writes S16 stereo frames (one 32-bit word each) into MCDT DAC channel 4 (0x56490000+0x10)
  *   -> DSP FE "FAST_PLAYBACK" (id 3) -> VBC TX0 -> IIS0 (24 bit, frame inverted) -> digital codec
@@ -480,19 +480,30 @@ void probe_main(uint64_t dtb, uint64_t load, uint64_t el)
 	rx_rd = rd32(PTRS + 8);
 	ipc_wait(0xffff, 0xffff, 50);		/* drain BOOT_OK etc. */
 
-	/* AGCP clocks: AUD_EB (19), MCDT_EB (12) */
-	wr32(AGCP_SET, (1u << 19) | (1u << 12));
-	delay_ms(1);
+	/* AGCP clocks: AUD_EB (19), MCDT_EB (12). V20 run 1: the set register (+0x1000) left bit 12 clear
+	 * (EB = 0x00C90000) and MCDT reads faulted. Try a plain read-modify-write too. */
 	kv("AGCP EB", rd32(AGCP_AHB), 8); kv("AGSEL", rd32(AGCP_AHB + 0x3c), 8); nl();
-	kv("MCDT AV", mcdt_avail(), 3); kv("ST", rd32(MCDT + 0x134), 8); nl();
+	wr32(AGCP_SET, (1u << 19) | (1u << 12));
+	wr32(AGCP_AHB, rd32(AGCP_AHB) | (1u << 19) | (1u << 12));
+	delay_ms(1);
+	kv("EB NOW", rd32(AGCP_AHB), 8); nl();
 
 	codec_on();
 	kv("PMU0", rd(0x1000), 4); kv("CLK0", rd(0x1068), 4); kv("CDC10", rd(0x109c), 4); kv("CDC9", rd(0x1098), 4); nl();
 	kv("DIG TOP", rd32(DIGC), 8); kv("DAC", rd32(DIGC + 0xc), 8); nl();
 
+	line("SCENE START (BEFORE MCDT)", YELLOW);
+	scene_start();
+	kv("EB AFTER", rd32(AGCP_AHB), 8); nl();
+	if (!(rd32(AGCP_AHB) & (1u << 12))) {
+		line("MCDT CLOCK STILL OFF - STOP", RED);
+		ipc_cmd(5, FE_FAST, 0, sp, spo);
+		for (;;) __asm__ volatile("wfe");
+	}
+	kv("MCDT AV", mcdt_avail(), 3); kv("ST", rd32(MCDT + 0x134), 8); nl();
+
 	for (int attempt = 0; attempt < 2; attempt++) {
-		label("SCENE START "); puthex(attempt, 1); nl();
-		scene_start();
+		if (attempt) { line("SCENE RESTART", YELLOW); scene_start(); }
 		/* MCDT ch4: clear, watermarks like Linux (full 511, empty 320), no DMA: PIO */
 		wr32(MCDT + 0x158, rd32(MCDT + 0x158) | (1u << MCH));
 		wr32(MCDT + 0x60 + 4 * MCH, (320u << 16) | 511u);
